@@ -43,7 +43,7 @@ impl Default for NetworkConfig {
             user_agent: format!("mc-server-download-tool/{}", crate::version::BUILD_VERSION),
             proxy: None,
             connect_timeout: Duration::from_secs(15),
-            read_timeout: Duration::from_secs(60),
+            read_timeout: Duration::from_mins(1),
             max_redirects: 10,
             max_attempts: 4,
             retry_base_delay: Duration::from_millis(200),

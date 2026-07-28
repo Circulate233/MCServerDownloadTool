@@ -80,11 +80,7 @@ impl WorkerPool {
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
-        let worker_count = self
-            .workers
-            .lock()
-            .map(|workers| workers.len())
-            .unwrap_or(0);
+        let worker_count = self.workers.lock().map_or(0, |workers| workers.len());
         for _ in 0..worker_count {
             if self.sender.send(Message::Shutdown).is_err() {
                 eprintln!("network worker pool shutdown channel closed unexpectedly");
