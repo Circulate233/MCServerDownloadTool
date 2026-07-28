@@ -62,8 +62,59 @@ function Get-CargoProject {
     $candidate = $binaryCandidates[0]
     [PSCustomObject]@{
         PackageName  = [string] $candidate.Package.name
-        Version      = [string] $candidate.Package.version
         BinaryName   = [string] $candidate.Target.name
         ManifestPath = [string] $candidate.Package.manifest_path
     }
+}
+
+function Test-StrictReleaseVersion {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string] $Version
+    )
+
+    return $Version -cmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+}
+
+function Test-BuildVersion {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string] $Version
+    )
+
+    return $Version -cmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\+[0-9a-f]{7})?$'
+}
+
+function Get-BuiltBinaryVersion {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $BinaryPath,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $BinaryName
+    )
+
+    if (-not (Test-Path -LiteralPath $BinaryPath -PathType Leaf)) {
+        throw "Built binary was not found at expected path: $BinaryPath"
+    }
+    $versionOutput = (& $BinaryPath --version 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        throw "Version probe failed with exit code $LASTEXITCODE for '$BinaryPath': $versionOutput"
+    }
+    $prefix = "$BinaryName "
+    if (-not $versionOutput.StartsWith($prefix, [StringComparison]::Ordinal)) {
+        throw "Version probe returned unexpected command identity '$versionOutput'; expected prefix '$prefix'."
+    }
+    $version = $versionOutput.Substring($prefix.Length)
+    if (-not (Test-BuildVersion -Version $version)) {
+        throw "Version probe returned invalid build version '$version'."
+    }
+    return $version
 }

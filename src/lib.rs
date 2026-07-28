@@ -15,6 +15,7 @@ pub mod loader;
 pub mod manifest;
 pub mod net;
 pub mod scripts;
+pub mod version;
 
 use manifest::JavaConfig;
 

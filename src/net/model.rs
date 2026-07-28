@@ -40,7 +40,7 @@ pub struct NetworkConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            user_agent: format!("mc-server-download-tool/{}", env!("CARGO_PKG_VERSION")),
+            user_agent: format!("mc-server-download-tool/{}", crate::version::BUILD_VERSION),
             proxy: None,
             connect_timeout: Duration::from_secs(15),
             read_timeout: Duration::from_secs(60),

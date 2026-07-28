@@ -15,21 +15,16 @@ if ([string]::IsNullOrWhiteSpace($Tag)) {
     throw "A release tag is required. Pass -Tag or set GITHUB_REF_NAME."
 }
 
-# SemVer 2.0.0: numeric identifiers have no leading zeroes; prerelease/build identifiers are ASCII only.
-$semVerPattern = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-((?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$'
 if (-not $Tag.StartsWith("v", [StringComparison]::Ordinal)) {
     throw "Release tag '$Tag' must start with a lowercase 'v'."
 }
 
 $tagVersion = $Tag.Substring(1)
-if ($tagVersion -cnotmatch $semVerPattern) {
-    throw "Release tag '$Tag' is not strict SemVer 2.0.0 (expected vMAJOR.MINOR.PATCH with optional prerelease/build metadata)."
+if (-not (Test-StrictReleaseVersion -Version $tagVersion)) {
+    throw "Release tag '$Tag' must match strict vX.Y.Z (decimal components, no leading zeroes, no prerelease or build metadata)."
 }
 
 $project = Get-CargoProject -RepositoryRoot $RepositoryRoot
-if ($tagVersion -cne $project.Version) {
-    throw "Tag version '$tagVersion' does not exactly match Cargo.toml package version '$($project.Version)'."
-}
 
 if ($env:GITHUB_OUTPUT) {
     @(

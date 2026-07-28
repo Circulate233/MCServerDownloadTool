@@ -1,6 +1,6 @@
 [package]
 name = "mc-server-download-tool"
-version = "0.1.0"
+version = "0.0.0"
 edition = "2024"
 license = "MIT"
 description = "Validated manifest runner for Minecraft server installation"

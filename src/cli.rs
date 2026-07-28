@@ -12,7 +12,7 @@ use crate::i18n::{Language, Localizer, resolve_language};
 
 /// Strict Minecraft server installation entry point.
 #[derive(Debug, Clone, Parser)]
-#[command(name = "mc-server-download-tool", version, about)]
+#[command(name = "mc-server-download-tool", about)]
 pub struct Cli {
     /// JSON manifest path; defaults to server-install.json beside the executable.
     #[arg(long, value_name = "PATH")]
@@ -130,6 +130,7 @@ fn localized_command(language: Language) -> clap::Command {
     Cli::command()
         .disable_help_flag(true)
         .disable_version_flag(true)
+        .version(crate::version::BUILD_VERSION)
         .about(localizer.cli_about())
         .help_template(localizer.cli_help_template())
         .mut_arg("manifest", |argument| {

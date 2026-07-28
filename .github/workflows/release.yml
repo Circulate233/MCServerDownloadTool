@@ -29,9 +29,10 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
 
-      - name: Validate SemVer and Cargo version
+      - name: Validate release tag
         id: release
         shell: pwsh
         run: ./.github/scripts/Verify-ReleaseTag.ps1
@@ -44,6 +45,8 @@ jobs:
       - name: Check out tagged source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
 
       - name: Check formatting
@@ -87,6 +90,8 @@ jobs:
       - name: Check out tagged source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
 
       - name: Install Rust target
@@ -105,7 +110,9 @@ jobs:
 
       - name: Build release binary
         shell: pwsh
-        run: cargo build --release --locked --target "${{ matrix.target }}"
+        run: >-
+          $env:MCSDT_RELEASE_VERSION = "${{ needs.validate.outputs.version }}";
+          cargo build --release --locked --target "${{ matrix.target }}"
 
       - name: Smoke test release binary
         shell: pwsh
@@ -113,6 +120,7 @@ jobs:
           ./.github/scripts/Test-BuiltBinary.ps1
           -Target "${{ matrix.target }}"
           -Platform "${{ matrix.platform }}"
+          -ExpectedVersion "${{ needs.validate.outputs.version }}"
 
       - name: Stage raw release asset
         id: stage
@@ -147,6 +155,8 @@ jobs:
       - name: Check out tagged source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
 
       - name: Download staged assets

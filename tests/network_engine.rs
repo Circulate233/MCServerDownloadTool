@@ -12,6 +12,7 @@ use mc_server_download_tool::net::{
     NetworkEngine, NetworkError, NetworkLimits, SensitiveHeaders, TransferError, TransferEvent,
     TransferObserver, TransferObserverError, TransferPhase,
 };
+use mc_server_download_tool::version::BUILD_VERSION;
 use reqwest::header::{HeaderName, HeaderValue};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
@@ -74,6 +75,14 @@ impl TestResponse {
         self.omit_length = true;
         self
     }
+}
+
+#[test]
+fn default_network_user_agent_reports_the_embedded_build_version() {
+    assert_eq!(
+        NetworkConfig::default().user_agent,
+        format!("mc-server-download-tool/{BUILD_VERSION}")
+    );
 }
 
 #[derive(Default)]

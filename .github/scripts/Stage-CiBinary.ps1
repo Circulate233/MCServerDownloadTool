@@ -30,12 +30,13 @@ $platformDirectory = Join-Path $OutputDirectory $Platform
 New-Item -ItemType Directory -Path $platformDirectory -Force | Out-Null
 $destination = Join-Path $platformDirectory "$($project.BinaryName)$extension"
 Copy-Item -LiteralPath $source -Destination $destination -Force
+$version = Get-BuiltBinaryVersion -BinaryPath $source -BinaryName $project.BinaryName
 
 $hash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
 $metadata = [ordered]@{
     schemaVersion = 1
     package       = $project.PackageName
-    version       = $project.Version
+    version       = $version
     binary        = [IO.Path]::GetFileName($destination)
     platform      = $Platform
     target        = $Target
@@ -44,7 +45,7 @@ $metadata = [ordered]@{
 }
 $metadata | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $platformDirectory "build-metadata.json") -Encoding utf8NoBOM
 
-$artifactName = "$($project.PackageName)-$Platform"
+$artifactName = "$($project.PackageName)-$version-$Platform"
 if ($env:GITHUB_OUTPUT) {
     @(
         "artifact-name=$artifactName"

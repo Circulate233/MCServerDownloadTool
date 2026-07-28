@@ -7,6 +7,7 @@ use mc_server_download_tool::cli::{
     Cli, ProxyUrl, resolve_manifest_path, resolve_proxy, try_parse_localized_from,
 };
 use mc_server_download_tool::i18n::{Language, resolve_language};
+use mc_server_download_tool::version::BUILD_VERSION;
 
 #[test]
 fn parses_all_supported_cli_options() {
@@ -151,6 +152,18 @@ fn process_exit_codes_distinguish_help_usage_and_manifest_io() {
         String::from_utf8(missing.stderr)
             .unwrap()
             .contains("failed to read manifest")
+    );
+}
+
+#[test]
+fn version_flag_reports_the_embedded_build_version() {
+    let executable = env!("CARGO_BIN_EXE_mc-server-download-tool");
+    let output = Command::new(executable).arg("--version").output().unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        format!("mc-server-download-tool {BUILD_VERSION}")
     );
 }
 

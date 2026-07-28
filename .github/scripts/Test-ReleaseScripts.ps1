@@ -6,10 +6,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
-. (Join-Path $PSScriptRoot "CargoProject.ps1")
 
-$project = Get-CargoProject -RepositoryRoot $RepositoryRoot
-$tag = "v$($project.Version)"
+$tagVersion = "7.8.9"
+$tag = "v$tagVersion"
 & (Join-Path $PSScriptRoot "Verify-ReleaseTag.ps1") -Tag $tag -RepositoryRoot $RepositoryRoot
 
 $invalidTagRejected = $false
@@ -20,7 +19,7 @@ catch {
     $invalidTagRejected = $true
 }
 if (-not $invalidTagRejected) {
-    throw "A non-SemVer release tag was accepted."
+    throw "A non-strict release tag was accepted."
 }
 
 $nativeTarget = if ($IsWindows) {
@@ -88,7 +87,7 @@ try {
         [ordered]@{
             schemaVersion = 1
             package       = "mc-server-download-tool"
-            version       = $project.Version
+            version       = $tagVersion
             asset         = $specification.Asset
             checksum      = $checksumName
             platform      = $specification.Platform
@@ -122,10 +121,13 @@ try {
     }
 
     $index = Get-Content -LiteralPath (Join-Path $outputDirectory "release-index.json") -Raw | ConvertFrom-Json -Depth 20
-    if ([string] $index.version -cne $project.Version -or @($index.assets).Count -ne 3) {
+    if ([string] $index.version -cne $tagVersion -or [string] $index.tag -cne $tag -or @($index.assets).Count -ne 3) {
         throw "Release index version or asset count is invalid."
     }
     foreach ($asset in $index.assets) {
+        if ([string] $asset.version -cne $tagVersion) {
+            throw "Release index asset '$($asset.name)' does not carry the exact release tag version."
+        }
         foreach ($field in @("version", "platform", "target", "size", "sha256", "url")) {
             if ($null -eq $asset.$field -or [string]::IsNullOrWhiteSpace([string] $asset.$field)) {
                 throw "Release index asset '$($asset.name)' is missing '$field'."

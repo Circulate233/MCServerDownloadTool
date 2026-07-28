@@ -34,12 +34,17 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "CargoProject.ps1")
 
 $expectedPlatforms = @("linux-x86_64", "macos-aarch64", "windows-x86_64")
 $expectedTargets = @{
     "linux-x86_64"  = "x86_64-unknown-linux-musl"
     "macos-aarch64" = "aarch64-apple-darwin"
     "windows-x86_64" = "x86_64-pc-windows-msvc"
+}
+$tagVersion = if ($Tag.StartsWith("v", [StringComparison]::Ordinal)) { $Tag.Substring(1) } else { "" }
+if (-not (Test-StrictReleaseVersion -Version $tagVersion)) {
+    throw "Release metadata tag '$Tag' must match strict vX.Y.Z."
 }
 $expectedAssets = @{
     "linux-x86_64"   = "MCServerDownloadTool-linux-x86_64"
@@ -134,7 +139,7 @@ $versions = @($records.Version | Sort-Object -Unique)
 if ($packages.Count -ne 1 -or $versions.Count -ne 1) {
     throw "All release assets must have one package and version. Packages: $($packages -join ', '); versions: $($versions -join ', ')."
 }
-if ("v$($versions[0])" -cne $Tag) {
+if ($versions[0] -cne $tagVersion) {
     throw "Downloaded asset version '$($versions[0])' does not match release tag '$Tag'."
 }
 

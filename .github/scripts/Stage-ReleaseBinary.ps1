@@ -24,8 +24,8 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "CargoProject.ps1")
 
 $project = Get-CargoProject -RepositoryRoot $RepositoryRoot
-if ($project.Version -cne $ExpectedVersion) {
-    throw "Package version '$($project.Version)' changed after tag validation; expected '$ExpectedVersion'."
+if (-not (Test-StrictReleaseVersion -Version $ExpectedVersion)) {
+    throw "Expected release version '$ExpectedVersion' is not strict X.Y.Z."
 }
 
 $expectedTargets = @{
@@ -39,8 +39,9 @@ if ($Target -cne $expectedTargets[$Platform]) {
 
 $sourceExtension = if ($Platform -eq "windows-x86_64") { ".exe" } else { "" }
 $source = Join-Path $RepositoryRoot "target/$Target/release/$($project.BinaryName)$sourceExtension"
-if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
-    throw "Built binary was not found at expected path: $source"
+$actualVersion = Get-BuiltBinaryVersion -BinaryPath $source -BinaryName $project.BinaryName
+if ($actualVersion -cne $ExpectedVersion) {
+    throw "Release binary reported '$actualVersion'; expected verified tag version '$ExpectedVersion'."
 }
 
 $assetNames = @{

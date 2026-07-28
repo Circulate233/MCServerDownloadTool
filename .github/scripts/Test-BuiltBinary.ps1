@@ -9,6 +9,9 @@ param(
     [string] $Platform,
 
     [Parameter()]
+    [string] $ExpectedVersion,
+
+    [Parameter()]
     [string] $RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 )
 
@@ -32,13 +35,9 @@ if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
     throw "Built binary was not found at expected path: $binary"
 }
 
-$versionOutput = (& $binary --version 2>&1 | Out-String).Trim()
-if ($LASTEXITCODE -ne 0) {
-    throw "Version smoke test failed with exit code $LASTEXITCODE for '$binary': $versionOutput"
-}
-$expectedOutput = "$($project.BinaryName) $($project.Version)"
-if ($versionOutput -cne $expectedOutput) {
-    throw "Version smoke test returned '$versionOutput'; expected '$expectedOutput'."
+$version = Get-BuiltBinaryVersion -BinaryPath $binary -BinaryName $project.BinaryName
+if (-not [string]::IsNullOrEmpty($ExpectedVersion) -and $version -cne $ExpectedVersion) {
+    throw "Version smoke test returned '$version'; expected release version '$ExpectedVersion'."
 }
 
-Write-Host "Smoke test passed: $versionOutput"
+Write-Host "Smoke test passed: $($project.BinaryName) $version"

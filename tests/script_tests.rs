@@ -26,9 +26,14 @@ fn java() -> JavaConfig {
     }
 }
 
-fn compile_fake_java(directory: &Path, executable_name: &str) -> PathBuf {
-    fs::create_dir_all(directory).unwrap();
-    let source = directory.join("fake_java.rs");
+fn compile_fake_java(
+    build_directory: &Path,
+    target_directory: &Path,
+    executable_name: &str,
+) -> PathBuf {
+    fs::create_dir_all(build_directory).unwrap();
+    fs::create_dir_all(target_directory).unwrap();
+    let source = build_directory.join("fake_java.rs");
     fs::write(
         &source,
         r#"
@@ -45,16 +50,28 @@ fn main() {
 "#,
     )
     .unwrap();
-    let executable = directory.join(executable_name);
+    let built_executable =
+        build_directory.join(format!("mcsdt-fake-java{}", std::env::consts::EXE_SUFFIX));
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
     let status = Command::new(rustc)
         .args(["--edition=2024", "--crate-name", "mcsdt_fake_java"])
         .arg(&source)
         .arg("-o")
-        .arg(&executable)
+        .arg(&built_executable)
         .status()
         .unwrap();
     assert!(status.success(), "failed to compile fake Java executable");
+
+    let executable = target_directory.join(executable_name);
+    fs::rename(&built_executable, &executable).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+    }
     executable
 }
 
@@ -246,7 +263,11 @@ fn windows_script_executes_special_paths_and_applies_console_ownership_behavior(
     let server_root = temp.path().join("server 空格!%&");
     let java_root = temp.path().join("Java 运行时 空格!%&");
     fs::create_dir_all(&server_root).unwrap();
-    let fake_java = compile_fake_java(&java_root, "fake Java 中文!%&.exe");
+    let fake_java = compile_fake_java(
+        &temp.path().join("helper-build"),
+        &java_root,
+        "fake Java 中文!%&.exe",
+    );
     let explorer_parent = compile_explorer_parent(&temp.path().join("explorer helper"));
     let capture = temp.path().join("captured arguments.txt");
     let java = JavaConfig {
@@ -335,7 +356,11 @@ fn unix_script_preserves_shell_arguments_working_directory_and_exit_status() {
     let server_root = temp.path().join("server 空格!%&'");
     let java_root = temp.path().join("Java runtime 空格!%&'");
     fs::create_dir_all(&server_root).unwrap();
-    let fake_java = compile_fake_java(&java_root, "fake Java 中文!%&'");
+    let fake_java = compile_fake_java(
+        &temp.path().join("helper-build"),
+        &java_root,
+        "fake Java 中文!%&'",
+    );
     let capture = temp.path().join("captured arguments.txt");
     let java = JavaConfig {
         major: 21,
