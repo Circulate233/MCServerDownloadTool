@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "minecraft": {
+    "version": "1.12.2"
+  },
+  "java": {
+    "major": 8,
+    "min_memory_mb": 1024,
+    "max_memory_mb": 4096,
+    "jvm_args": [
+      "-XX:+UseG1GC"
+    ],
+    "server_args": [
+      "nogui"
+    ]
+  },
+  "loader": {
+    "kind": "cleanroom",
+    "version": "0.6.7-alpha",
+    "installer": {
+      "url": "https://github.com/CleanroomMC/Cleanroom/releases/download/0.6.7-alpha/cleanroom-0.6.7-alpha-installer.jar",
+      "sha1": "171e1953354b93690bb1f2a0fc4a1b299f9b4188",
+      "size": 6968390
+    },
+    "output": {
+      "type": "exact_jar",
+      "path": "cleanroom-1.12.2.jar",
+      "main_class": null
+    }
+  },
+  "files": []
+}
