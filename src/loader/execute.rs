@@ -18,7 +18,7 @@ use super::verify::verify_loader_output;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemProcessRunner;
 
-const LOADER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const LOADER_TIMEOUT: Duration = Duration::from_mins(30);
 const MAX_LOADER_LINE_BYTES: usize = 64 * 1024;
 const MAX_LOADER_STREAM_BYTES: usize = 16 * 1024 * 1024;
 

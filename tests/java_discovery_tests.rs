@@ -166,6 +166,32 @@ fn materialized_candidates_follow_java_executable_symlinks() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn materialized_candidates_do_not_traverse_linked_directories() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("jdk");
+    let outside = temp.path().join("outside/bin");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("java"), b"test launcher").unwrap();
+    symlink(temp.path().join("outside"), root.join("linked-runtime")).unwrap();
+    let plan = CandidatePlan {
+        direct_executables: Vec::new(),
+        search_roots: vec![SearchRoot {
+            path: root,
+            max_depth: 3,
+        }],
+        search_patterns: Vec::new(),
+    };
+
+    let report = discover_from_plan(&plan, JavaPlatform::Linux);
+
+    assert!(report.candidates.is_empty());
+}
+
 #[test]
 fn parses_legacy_and_modern_java_properties() {
     let legacy = parse_java_properties(

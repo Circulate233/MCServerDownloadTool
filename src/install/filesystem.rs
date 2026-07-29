@@ -430,7 +430,7 @@ fn sync_directory_handle(directory: &Dir) -> io::Result<()> {
         // it with EBADF. Reopening its procfs identity obtains a regular
         // directory descriptor for durability without resolving an ambient
         // installation path or releasing the pinned handle.
-        return fs::File::open(format!("/proc/self/fd/{}", directory.as_raw_fd()))?.sync_all();
+        fs::File::open(format!("/proc/self/fd/{}", directory.as_raw_fd()))?.sync_all()
     }
 
     #[cfg(not(target_os = "linux"))]

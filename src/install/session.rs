@@ -55,12 +55,14 @@ impl InstallSession {
         root.verify_target(&log_path)?;
         match fs::symlink_metadata(&log_path) {
             Ok(metadata) => {
-                if is_link_or_reparse(&metadata)
-                    || has_multiple_links(&log_path, &metadata).map_err(|source| {
+                #[cfg(unix)]
+                let multiple_links = has_multiple_links(&log_path, &metadata);
+                #[cfg(not(unix))]
+                let multiple_links =
+                    has_multiple_links(&log_path, &metadata).map_err(|source| {
                         InstallError::io("inspect installation log link count", &log_path, source)
-                    })?
-                    || !metadata.is_file()
-                {
+                    })?;
+                if is_link_or_reparse(&metadata) || multiple_links || !metadata.is_file() {
                     return Err(InstallError::UnsafePath {
                         path: log_path,
                         reason: "installation log must be a regular file with one link".to_string(),
@@ -333,9 +335,9 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(unix)]
-fn has_multiple_links(_path: &Path, metadata: &fs::Metadata) -> io::Result<bool> {
+fn has_multiple_links(_path: &Path, metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
-    Ok(metadata.nlink() > 1)
+    metadata.nlink() > 1
 }
 
 #[cfg(windows)]
