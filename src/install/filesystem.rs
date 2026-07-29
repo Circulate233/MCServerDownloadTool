@@ -421,7 +421,22 @@ fn transport_path(_directory: &Dir, fallback: &Path, name: &OsStr) -> PathBuf {
 
 #[cfg(unix)]
 fn sync_directory_handle(directory: &Dir) -> io::Result<()> {
-    directory.try_clone()?.into_std_file().sync_all()
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        // cap-std intentionally opens Linux directories with O_PATH. That
+        // descriptor is valid as a renameat base, but Linux rejects fsync on
+        // it with EBADF. Reopening its procfs identity obtains a regular
+        // directory descriptor for durability without resolving an ambient
+        // installation path or releasing the pinned handle.
+        return fs::File::open(format!("/proc/self/fd/{}", directory.as_raw_fd()))?.sync_all();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        directory.try_clone()?.into_std_file().sync_all()
+    }
 }
 
 fn reject_cap_link(path: &Path, metadata: &cap_std::fs::Metadata) -> Result<(), InstallError> {
@@ -523,6 +538,22 @@ mod tests {
         download.publish().unwrap();
 
         assert_eq!(fs::read(&target).unwrap(), b"verified bytes");
+        assert!(!download.staging_path().exists());
+    }
+
+    #[test]
+    fn anchored_download_replaces_an_existing_artifact() {
+        let installation = tempfile::tempdir().unwrap();
+        let root = root(&installation);
+        let target = root.path().join("mods/example.jar");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"outdated bytes").unwrap();
+        let download = root.download_target(&target, 3).unwrap();
+
+        fs::write(download.staging_path(), b"verified replacement").unwrap();
+        download.publish().unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"verified replacement");
         assert!(!download.staging_path().exists());
     }
 
