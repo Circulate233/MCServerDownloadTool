@@ -228,7 +228,21 @@ pub fn build_candidate_plan(inputs: &DiscoveryInputs) -> CandidatePlan {
 
 fn platform_absolute(path: &Path, platform: JavaPlatform) -> bool {
     match platform {
-        JavaPlatform::Windows => path.is_absolute(),
+        JavaPlatform::Windows => {
+            if path.is_absolute() {
+                return true;
+            }
+
+            // Candidate-plan tests deliberately model Windows paths on Unix
+            // hosts. `Path::is_absolute` uses the host parser, therefore it
+            // cannot recognize a Windows drive path there.
+            let value = path.as_os_str().to_string_lossy();
+            let bytes = value.as_bytes();
+            bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'\\' | b'/')
+        }
         JavaPlatform::Linux | JavaPlatform::MacOs => path.to_string_lossy().starts_with('/'),
     }
 }
@@ -766,12 +780,8 @@ fn scan_root(
                     continue;
                 }
             };
-            if file_type.is_symlink() {
-                continue;
-            }
             let metadata = match fs::symlink_metadata(&path) {
-                Ok(metadata) if !is_link_or_reparse(&metadata) => metadata,
-                Ok(_) => continue,
+                Ok(metadata) => metadata,
                 Err(source) => {
                     push_warning(
                         warnings,
@@ -783,7 +793,7 @@ fn scan_root(
                     continue;
                 }
             };
-            let is_file = metadata.is_file();
+            let is_file = metadata.is_file() || file_type.is_symlink();
             let is_directory = metadata.is_dir();
             if is_file && filename_matches(&entry.file_name(), executable_name, platform) {
                 add_canonical_executable(
@@ -809,11 +819,30 @@ fn add_canonical_executable(
     warnings: &mut Vec<DiscoveryWarning>,
     budget: &mut ScanBudget,
 ) {
-    if !executable.is_absolute() || !trusted_regular_file(executable) {
+    if !executable.is_absolute() {
+        return;
+    }
+    let metadata = match fs::symlink_metadata(executable) {
+        Ok(metadata) => metadata,
+        Err(source) => {
+            push_warning(
+                warnings,
+                DiscoveryWarning {
+                    source: executable.display().to_string(),
+                    reason: source.to_string(),
+                },
+            );
+            return;
+        }
+    };
+    let is_regular_file = metadata.is_file() && !is_link_or_reparse(&metadata);
+    let is_final_link =
+        metadata.file_type().is_symlink() && executable.parent().is_some_and(trusted_directory);
+    if !is_regular_file && !is_final_link {
         return;
     }
     match fs::canonicalize(executable) {
-        Ok(canonical) => {
+        Ok(canonical) if trusted_regular_file(&canonical) => {
             if canonical_keys.insert(path_key(&canonical, platform)) {
                 if !budget.take_candidate(warnings) {
                     return;
@@ -821,6 +850,7 @@ fn add_canonical_executable(
                 candidates.push(canonical);
             }
         }
+        Ok(_) => {}
         Err(source) => warnings.push(DiscoveryWarning {
             source: executable.display().to_string(),
             reason: source.to_string(),
