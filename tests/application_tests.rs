@@ -30,6 +30,7 @@ impl Environment for EmptyEnvironment {
 fn manifest_json() -> serde_json::Value {
     json!({
         "schema_version": 1,
+        "curseforge_api_key": "test-key",
         "minecraft": { "version": "1.12.2" },
         "java": {
             "major": 8,
@@ -59,9 +60,9 @@ fn manifest_json() -> serde_json::Value {
                 "path": "mods/automatic.jar",
                 "download": {
                     "mode": "automatic",
-                    "url": "https://downloads.example.com/automatic.jar"
+                    "url": "https://edge.forgecdn.net/files/1234/56/automatic.jar"
                 },
-                "project_page": "https://example.com/automatic",
+                "project_page": "https://www.curseforge.com/minecraft/mc-mods/automatic/files/123456",
                 "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "size": 1024
             },
@@ -70,7 +71,7 @@ fn manifest_json() -> serde_json::Value {
                 "type": "mod",
                 "path": "mods/manual.jar",
                 "download": { "mode": "manual" },
-                "project_page": "https://example.com/manual",
+                "project_page": "https://www.curseforge.com/minecraft/mc-mods/manual/files/123457",
                 "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 "size": 2048
             }
@@ -89,6 +90,25 @@ struct LockProbeJava {
     observed_lock: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+struct PreferredJava {
+    received: Arc<Mutex<Option<PathBuf>>>,
+}
+
+impl JavaRuntimeProvisioner for PreferredJava {
+    type Error = io::Error;
+
+    fn provision(
+        &self,
+        _config: &mc_server_download_tool::manifest::JavaConfig,
+        _server_root: &Path,
+        preferred: Option<&Path>,
+    ) -> Result<PathBuf, Self::Error> {
+        *self.received.lock().unwrap() = preferred.map(Path::to_path_buf);
+        Ok(PathBuf::from("C:/selected/java.exe"))
+    }
+}
+
 impl JavaRuntimeProvisioner for LockProbeJava {
     type Error = io::Error;
 
@@ -96,6 +116,7 @@ impl JavaRuntimeProvisioner for LockProbeJava {
         &self,
         _config: &mc_server_download_tool::manifest::JavaConfig,
         _server_root: &Path,
+        _preferred: Option<&Path>,
     ) -> Result<PathBuf, Self::Error> {
         let competing = InstallSession::acquire(
             &self.manifest_path,
@@ -120,6 +141,7 @@ impl JavaRuntimeProvisioner for FakeJava {
         &self,
         config: &mc_server_download_tool::manifest::JavaConfig,
         server_root: &Path,
+        _preferred: Option<&Path>,
     ) -> Result<PathBuf, Self::Error> {
         self.calls
             .lock()
@@ -222,6 +244,59 @@ fn application_orchestrates_final_manifest_into_one_install_execution() {
         FileDownload::Automatic { .. }
     ));
     assert!(matches!(plan.files[1].download, FileDownload::Manual));
+}
+
+#[test]
+fn application_passes_saved_java_to_provisioner_before_installation() {
+    let temp = tempfile::tempdir().unwrap();
+    let manifest_path = temp.path().join("server-install.json");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest_json()).unwrap(),
+    )
+    .unwrap();
+    std::fs::create_dir(temp.path().join(".mcsdt")).unwrap();
+    let saved = temp.path().join("saved-java/bin/java.exe");
+    std::fs::write(
+        temp.path().join(".mcsdt/install-state.json"),
+        serde_json::to_vec(&json!({
+            "manifest_sha256": "00",
+            "java_executable": saved,
+            "loader_plan_sha256": "00",
+            "loader_output": {"type": "jar", "path": "cleanroom-1.12.2.jar"},
+            "loader_artifacts": [],
+            "script_sha256": "00"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let received = Arc::new(Mutex::new(None));
+    let application = ApplicationImpl::new(
+        PreferredJava {
+            received: Arc::clone(&received),
+        },
+        FakeInstall {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            captured: Arc::new(Mutex::new(None)),
+        },
+        ScriptPlatform::Windows,
+    );
+
+    application
+        .run(
+            Cli {
+                manifest: Some(manifest_path),
+                lang: Some(Language::EnUs),
+                proxy: None,
+            },
+            Path::new("C:/tool.exe"),
+            None,
+            &EmptyEnvironment,
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+
+    assert_eq!(received.lock().unwrap().as_deref(), Some(saved.as_path()));
 }
 
 #[test]
@@ -372,10 +447,14 @@ fn runtime_rejects_resources_and_loader_outputs_that_replace_selected_manifest()
             )
             .unwrap_err();
 
-        assert!(matches!(
-            error,
-            AppError::Installation(InstallError::InvalidPlan { .. })
-        ));
+        match target_kind {
+            "resource" => assert!(matches!(
+                error,
+                AppError::Installation(InstallError::InvalidPlan { .. })
+            )),
+            "loader" => assert!(matches!(error, AppError::Manifest(_))),
+            _ => unreachable!(),
+        }
         assert!(calls.lock().unwrap().is_empty());
     }
 }

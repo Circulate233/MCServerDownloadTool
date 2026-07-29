@@ -3,7 +3,8 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -12,6 +13,41 @@ use super::process::{ProcessRequest, ProcessRunner};
 
 const DISCOVERY_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const SEARCH_DEPTH: usize = 6;
+const MAX_SCAN_DIRECTORIES: usize = 4096;
+const MAX_SCAN_ENTRIES: usize = 100_000;
+const MAX_PATTERN_ENTRIES: usize = 1024;
+const MAX_DISCOVERY_WARNINGS: usize = 256;
+const MAX_REGISTRY_WORKERS: usize = 4;
+const MAX_REGISTRY_OUTPUT: usize = 2 * 1024 * 1024;
+const WINDOWS_REGISTRY_KEYS: &[&str] = &[
+    r"HKLM\SOFTWARE\JavaSoft",
+    r"HKLM\SOFTWARE\WOW6432Node\JavaSoft",
+    r"HKLM\SOFTWARE\Eclipse Adoptium",
+    r"HKLM\SOFTWARE\Adoptium",
+    r"HKLM\SOFTWARE\Microsoft\JDK",
+    r"HKLM\SOFTWARE\Azul Systems",
+    r"HKLM\SOFTWARE\BellSoft",
+    r"HKLM\SOFTWARE\Amazon Corretto",
+    r"HKLM\SOFTWARE\IBM\Semeru",
+    r"HKLM\SOFTWARE\Semeru",
+    r"HKLM\SOFTWARE\SAP\SapMachine",
+    r"HKLM\SOFTWARE\GraalVM",
+    r"HKLM\SOFTWARE\JetBrains",
+    r"HKLM\SOFTWARE\Red Hat",
+    r"HKCU\SOFTWARE\JavaSoft",
+    r"HKCU\SOFTWARE\Eclipse Adoptium",
+    r"HKCU\SOFTWARE\Adoptium",
+    r"HKCU\SOFTWARE\Microsoft\JDK",
+    r"HKCU\SOFTWARE\Azul Systems",
+    r"HKCU\SOFTWARE\BellSoft",
+    r"HKCU\SOFTWARE\Amazon Corretto",
+    r"HKCU\SOFTWARE\IBM\Semeru",
+    r"HKCU\SOFTWARE\Semeru",
+    r"HKCU\SOFTWARE\SAP\SapMachine",
+    r"HKCU\SOFTWARE\GraalVM",
+    r"HKCU\SOFTWARE\JetBrains",
+    r"HKCU\SOFTWARE\Red Hat",
+];
 
 /// Operating-system layout whose Java installation conventions are generated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,7 +106,7 @@ pub struct DiscoveryInputs {
     pub registry_homes: Vec<PathBuf>,
     /// Java homes reported by a platform facility such as `java_home`.
     pub platform_java_homes: Vec<PathBuf>,
-    /// Server root whose local runtime directory should be considered.
+    /// Server root retained for caller context; it is never searched for Java.
     pub server_root: PathBuf,
 }
 
@@ -156,7 +192,9 @@ pub fn build_candidate_plan(inputs: &DiscoveryInputs) -> CandidatePlan {
     let executable = inputs.platform.executable_name();
     let mut direct = Vec::new();
     for path_entry in &inputs.path_entries {
-        direct.push(path_entry.join(executable));
+        if platform_absolute(path_entry, inputs.platform) && !path_entry.as_os_str().is_empty() {
+            direct.push(path_entry.join(executable));
+        }
     }
     for home in inputs
         .java_home
@@ -165,7 +203,9 @@ pub fn build_candidate_plan(inputs: &DiscoveryInputs) -> CandidatePlan {
         .chain(inputs.registry_homes.iter())
         .chain(inputs.platform_java_homes.iter())
     {
-        direct.push(home.join("bin").join(executable));
+        if platform_absolute(home, inputs.platform) && !home.as_os_str().is_empty() {
+            direct.push(home.join("bin").join(executable));
+        }
     }
 
     let mut roots = Vec::new();
@@ -175,17 +215,21 @@ pub fn build_candidate_plan(inputs: &DiscoveryInputs) -> CandidatePlan {
         JavaPlatform::Linux => add_linux_roots(inputs, &mut roots, &mut patterns),
         JavaPlatform::MacOs => add_macos_roots(inputs, &mut roots),
     }
-    roots.push(SearchRoot {
-        path: inputs.server_root.join("runtime"),
-        max_depth: SEARCH_DEPTH,
-    });
-
+    roots.retain(|root| platform_absolute(&root.path, inputs.platform));
+    patterns.retain(|pattern| platform_absolute(&pattern.parent, inputs.platform));
     deduplicate_paths(&mut direct, inputs.platform);
     deduplicate_search_roots(&mut roots, inputs.platform);
     CandidatePlan {
         direct_executables: direct,
         search_roots: roots,
         search_patterns: patterns,
+    }
+}
+
+fn platform_absolute(path: &Path, platform: JavaPlatform) -> bool {
+    match platform {
+        JavaPlatform::Windows => path.is_absolute(),
+        JavaPlatform::Linux | JavaPlatform::MacOs => path.to_string_lossy().starts_with('/'),
     }
 }
 
@@ -327,7 +371,7 @@ where
         let mut warnings = Vec::new();
         let (registry_homes, platform_java_homes) = match platform {
             JavaPlatform::Windows => (
-                collect_windows_registry_homes(self.process.as_ref(), &mut warnings),
+                collect_windows_registry_homes(&self.process, &mut warnings),
                 Vec::new(),
             ),
             JavaPlatform::MacOs => (
@@ -364,55 +408,111 @@ where
     }
 }
 
-fn collect_windows_registry_homes<R: ProcessRunner>(
-    process: &R,
+fn collect_windows_registry_homes<R>(
+    process: &Arc<R>,
     warnings: &mut Vec<DiscoveryWarning>,
-) -> Vec<PathBuf> {
-    let keys = [
-        r"HKLM\SOFTWARE\JavaSoft",
-        r"HKLM\SOFTWARE\WOW6432Node\JavaSoft",
-        r"HKLM\SOFTWARE\Eclipse Adoptium",
-        r"HKLM\SOFTWARE\Adoptium",
-        r"HKLM\SOFTWARE\Microsoft\JDK",
-        r"HKLM\SOFTWARE\Azul Systems",
-        r"HKLM\SOFTWARE\BellSoft",
-        r"HKLM\SOFTWARE\Amazon Corretto",
-        r"HKLM\SOFTWARE\IBM\Semeru",
-        r"HKLM\SOFTWARE\Semeru",
-        r"HKLM\SOFTWARE\SAP\SapMachine",
-        r"HKLM\SOFTWARE\GraalVM",
-        r"HKLM\SOFTWARE\JetBrains",
-        r"HKLM\SOFTWARE\Red Hat",
-        r"HKCU\SOFTWARE\JavaSoft",
-        r"HKCU\SOFTWARE\Eclipse Adoptium",
-        r"HKCU\SOFTWARE\Adoptium",
-        r"HKCU\SOFTWARE\Microsoft\JDK",
-        r"HKCU\SOFTWARE\Azul Systems",
-        r"HKCU\SOFTWARE\BellSoft",
-        r"HKCU\SOFTWARE\Amazon Corretto",
-        r"HKCU\SOFTWARE\IBM\Semeru",
-        r"HKCU\SOFTWARE\Semeru",
-        r"HKCU\SOFTWARE\SAP\SapMachine",
-        r"HKCU\SOFTWARE\GraalVM",
-        r"HKCU\SOFTWARE\JetBrains",
-        r"HKCU\SOFTWARE\Red Hat",
-    ];
+) -> Vec<PathBuf>
+where
+    R: ProcessRunner + 'static,
+{
+    let Some(reg_executable) = trusted_system32_executable("reg.exe") else {
+        push_warning(
+            warnings,
+            DiscoveryWarning {
+                source: "Windows registry".to_string(),
+                reason: "%SystemRoot%\\System32\\reg.exe is unavailable or unsafe".to_string(),
+            },
+        );
+        return Vec::new();
+    };
+    let queue = Arc::new(Mutex::new(
+        WINDOWS_REGISTRY_KEYS
+            .iter()
+            .copied()
+            .enumerate()
+            .collect::<VecDeque<_>>(),
+    ));
+    let results = Arc::new(Mutex::new(Vec::new()));
+    thread::scope(|scope| {
+        for _ in 0..MAX_REGISTRY_WORKERS {
+            let queue = Arc::clone(&queue);
+            let results = Arc::clone(&results);
+            let process = Arc::clone(process);
+            let reg_executable = reg_executable.clone();
+            scope.spawn(move || {
+                loop {
+                    let task = queue.lock().ok().and_then(|mut queue| queue.pop_front());
+                    let Some((index, key)) = task else {
+                        break;
+                    };
+                    let request = ProcessRequest::new(&reg_executable, DISCOVERY_COMMAND_TIMEOUT)
+                        .with_arguments(["query", key, "/s"])
+                        .with_output_limit(MAX_REGISTRY_OUTPUT);
+                    let result = process.run(&request);
+                    if let Ok(mut results) = results.lock() {
+                        results.push((index, key, result));
+                    }
+                }
+            });
+        }
+    });
+    let Some(mut results) = take_registry_results(results, warnings) else {
+        return Vec::new();
+    };
+    results.sort_by_key(|(index, _, _)| *index);
     let mut homes = Vec::new();
-    for key in keys {
-        let request = ProcessRequest::new("reg.exe", DISCOVERY_COMMAND_TIMEOUT)
-            .with_arguments(["query", key, "/s"]);
-        match process.run(&request) {
+    for (_, key, result) in results {
+        match result {
             Ok(output) if output.exit_code == Some(0) => {
                 homes.extend(parse_registry_homes(&output.stdout));
             }
             Ok(_) => {}
-            Err(error) => warnings.push(DiscoveryWarning {
-                source: key.to_string(),
-                reason: error.to_string(),
-            }),
+            Err(error) => push_warning(
+                warnings,
+                DiscoveryWarning {
+                    source: key.to_string(),
+                    reason: error.to_string(),
+                },
+            ),
         }
     }
     homes
+}
+
+fn take_registry_results<T>(
+    results: Arc<Mutex<Vec<T>>>,
+    warnings: &mut Vec<DiscoveryWarning>,
+) -> Option<Vec<T>> {
+    let Ok(results) = Arc::try_unwrap(results) else {
+        push_warning(
+            warnings,
+            DiscoveryWarning {
+                source: "Windows registry".to_string(),
+                reason: "registry workers retained result ownership unexpectedly".to_string(),
+            },
+        );
+        return None;
+    };
+    let Ok(results) = results.into_inner() else {
+        push_warning(
+            warnings,
+            DiscoveryWarning {
+                source: "Windows registry".to_string(),
+                reason: "registry result mutex was poisoned".to_string(),
+            },
+        );
+        return None;
+    };
+    Some(results)
+}
+
+fn trusted_system32_executable(name: &str) -> Option<PathBuf> {
+    let root = env::var_os("SystemRoot").map(PathBuf::from)?;
+    if !root.is_absolute() {
+        return None;
+    }
+    let executable = root.join("System32").join(name);
+    trusted_regular_file(&executable).then_some(executable)
 }
 
 fn parse_registry_homes(output: &[u8]) -> Vec<PathBuf> {
@@ -501,6 +601,7 @@ fn materialize_candidates(
     let executable_name = platform.executable_name();
     let mut candidates = Vec::new();
     let mut canonical_keys = HashSet::new();
+    let mut budget = ScanBudget::default();
     for executable in &plan.direct_executables {
         add_canonical_executable(
             executable,
@@ -508,6 +609,7 @@ fn materialize_candidates(
             &mut canonical_keys,
             &mut candidates,
             warnings,
+            &mut budget,
         );
     }
     for root in &plan.search_roots {
@@ -518,6 +620,7 @@ fn materialize_candidates(
             &mut canonical_keys,
             &mut candidates,
             warnings,
+            &mut budget,
         );
     }
     for pattern in &plan.search_patterns {
@@ -528,6 +631,7 @@ fn materialize_candidates(
             &mut canonical_keys,
             &mut candidates,
             warnings,
+            &mut budget,
         );
     }
     candidates.sort_by_key(|candidate| path_key(candidate, platform));
@@ -541,8 +645,9 @@ fn scan_pattern(
     canonical_keys: &mut HashSet<String>,
     candidates: &mut Vec<PathBuf>,
     warnings: &mut Vec<DiscoveryWarning>,
+    budget: &mut ScanBudget,
 ) {
-    if !pattern.parent.is_dir() {
+    if !trusted_directory(&pattern.parent) {
         return;
     }
     let entries = match fs::read_dir(&pattern.parent) {
@@ -556,6 +661,9 @@ fn scan_pattern(
         }
     };
     for entry in entries {
+        if !budget.take_pattern_entry(warnings) {
+            return;
+        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(source) => {
@@ -584,6 +692,7 @@ fn scan_pattern(
             canonical_keys,
             candidates,
             warnings,
+            budget,
         );
     }
 }
@@ -595,13 +704,20 @@ fn scan_root(
     canonical_keys: &mut HashSet<String>,
     candidates: &mut Vec<PathBuf>,
     warnings: &mut Vec<DiscoveryWarning>,
+    budget: &mut ScanBudget,
 ) {
-    if !root.path.is_dir() {
+    if !trusted_directory(&root.path) {
         return;
     }
     let mut directories = VecDeque::from([(root.path.clone(), 0_usize)]);
     let mut visited = HashSet::new();
     while let Some((directory, depth)) = directories.pop_front() {
+        if !budget.take_directory(warnings) {
+            return;
+        }
+        if !trusted_directory(&directory) {
+            continue;
+        }
         let canonical_directory = match fs::canonicalize(&directory) {
             Ok(path) => path,
             Err(source) => {
@@ -626,6 +742,9 @@ fn scan_root(
             }
         };
         for entry in entries {
+            if !budget.take_entry(warnings) {
+                return;
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(source) => {
@@ -647,22 +766,34 @@ fn scan_root(
                     continue;
                 }
             };
-            let (is_file, is_directory) = if file_type.is_symlink() {
-                match fs::metadata(&path) {
-                    Ok(metadata) => (metadata.is_file(), metadata.is_dir()),
-                    Err(source) => {
-                        warnings.push(DiscoveryWarning {
+            if file_type.is_symlink() {
+                continue;
+            }
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) if !is_link_or_reparse(&metadata) => metadata,
+                Ok(_) => continue,
+                Err(source) => {
+                    push_warning(
+                        warnings,
+                        DiscoveryWarning {
                             source: path.display().to_string(),
                             reason: source.to_string(),
-                        });
-                        continue;
-                    }
+                        },
+                    );
+                    continue;
                 }
-            } else {
-                (file_type.is_file(), file_type.is_dir())
             };
+            let is_file = metadata.is_file();
+            let is_directory = metadata.is_dir();
             if is_file && filename_matches(&entry.file_name(), executable_name, platform) {
-                add_canonical_executable(&path, platform, canonical_keys, candidates, warnings);
+                add_canonical_executable(
+                    &path,
+                    platform,
+                    canonical_keys,
+                    candidates,
+                    warnings,
+                    budget,
+                );
             } else if depth < root.max_depth && is_directory {
                 directories.push_back((path, depth + 1));
             }
@@ -676,13 +807,17 @@ fn add_canonical_executable(
     canonical_keys: &mut HashSet<String>,
     candidates: &mut Vec<PathBuf>,
     warnings: &mut Vec<DiscoveryWarning>,
+    budget: &mut ScanBudget,
 ) {
-    if !executable.is_file() {
+    if !executable.is_absolute() || !trusted_regular_file(executable) {
         return;
     }
     match fs::canonicalize(executable) {
         Ok(canonical) => {
             if canonical_keys.insert(path_key(&canonical, platform)) {
+                if !budget.take_candidate(warnings) {
+                    return;
+                }
                 candidates.push(canonical);
             }
         }
@@ -690,6 +825,93 @@ fn add_canonical_executable(
             source: executable.display().to_string(),
             reason: source.to_string(),
         }),
+    }
+}
+
+#[derive(Default)]
+struct ScanBudget {
+    directories: usize,
+    entries: usize,
+    pattern_entries: usize,
+    candidates: usize,
+    limit_reported: bool,
+}
+
+impl ScanBudget {
+    fn take_directory(&mut self, warnings: &mut Vec<DiscoveryWarning>) -> bool {
+        self.directories += 1;
+        self.check(self.directories <= MAX_SCAN_DIRECTORIES, warnings)
+    }
+
+    fn take_entry(&mut self, warnings: &mut Vec<DiscoveryWarning>) -> bool {
+        self.entries += 1;
+        self.check(self.entries <= MAX_SCAN_ENTRIES, warnings)
+    }
+
+    fn take_pattern_entry(&mut self, warnings: &mut Vec<DiscoveryWarning>) -> bool {
+        self.pattern_entries += 1;
+        self.check(self.pattern_entries <= MAX_PATTERN_ENTRIES, warnings)
+    }
+
+    fn take_candidate(&mut self, warnings: &mut Vec<DiscoveryWarning>) -> bool {
+        self.candidates += 1;
+        self.check(
+            self.candidates <= super::probe::MAX_JAVA_CANDIDATES,
+            warnings,
+        )
+    }
+
+    fn check(&mut self, allowed: bool, warnings: &mut Vec<DiscoveryWarning>) -> bool {
+        if !allowed && !self.limit_reported {
+            self.limit_reported = true;
+            push_warning(
+                warnings,
+                DiscoveryWarning {
+                    source: "Java discovery".to_string(),
+                    reason:
+                        "filesystem discovery safety limit reached; remaining entries were skipped"
+                            .to_string(),
+                },
+            );
+        }
+        allowed
+    }
+}
+
+fn push_warning(warnings: &mut Vec<DiscoveryWarning>, warning: DiscoveryWarning) {
+    if warnings.len() < MAX_DISCOVERY_WARNINGS {
+        warnings.push(warning);
+    }
+}
+
+fn trusted_regular_file(path: &Path) -> bool {
+    path.is_absolute()
+        && path.ancestors().all(|component| {
+            fs::symlink_metadata(component).is_ok_and(|metadata| !is_link_or_reparse(&metadata))
+        })
+        && fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && !is_link_or_reparse(&metadata))
+}
+
+fn trusted_directory(path: &Path) -> bool {
+    path.is_absolute()
+        && fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_dir() && !is_link_or_reparse(&metadata))
+}
+
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 

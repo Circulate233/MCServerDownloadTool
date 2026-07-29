@@ -6,6 +6,8 @@ use zip::ZipArchive;
 
 use super::model::{LoaderError, LoaderOutputExpectation, VerifiedLaunch};
 
+const MAX_JAR_MANIFEST_BYTES: u64 = 1024 * 1024;
+
 /// Verifies exact loader outputs without scanning for approximate jar names.
 ///
 /// # Errors
@@ -75,7 +77,26 @@ fn jar_main_class(path: &Path) -> Result<Option<String>, LoaderError> {
                 path: path.to_path_buf(),
                 reason: error.to_string(),
             })?;
+    if manifest.size() > MAX_JAR_MANIFEST_BYTES {
+        return Err(LoaderError::Jar {
+            path: path.to_path_buf(),
+            reason: format!(
+                "META-INF/MANIFEST.MF expands to {} bytes, exceeding the {}-byte limit",
+                manifest.size(),
+                MAX_JAR_MANIFEST_BYTES
+            ),
+        });
+    }
     let mut text = String::new();
+    let manifest_size = usize::try_from(manifest.size()).map_err(|source| LoaderError::Jar {
+        path: path.to_path_buf(),
+        reason: format!("manifest size cannot be represented on this platform: {source}"),
+    })?;
+    text.try_reserve(manifest_size)
+        .map_err(|source| LoaderError::Jar {
+            path: path.to_path_buf(),
+            reason: format!("could not reserve bounded manifest buffer: {source}"),
+        })?;
     manifest
         .read_to_string(&mut text)
         .map_err(|source| LoaderError::OutputIo {

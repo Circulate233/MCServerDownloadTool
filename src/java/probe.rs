@@ -14,6 +14,12 @@ use super::process::{EnvironmentPolicy, ProcessError, ProcessRequest, ProcessRun
 
 /// Maximum duration of one Java metadata probe.
 pub const JAVA_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Maximum bytes accepted independently from Java probe stdout and stderr.
+pub const JAVA_PROBE_OUTPUT_LIMIT: usize = 256 * 1024;
+/// Maximum Java executables considered in one selection run.
+pub const MAX_JAVA_CANDIDATES: usize = 256;
+/// Maximum parallel Java processes used even on very high core-count hosts.
+pub const MAX_JAVA_PROBE_WORKERS: usize = 16;
 
 /// Verified metadata reported by a Java executable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,7 +115,8 @@ where
     fn inspect(&self, executable: &Path) -> Result<JavaRuntime, ProbeError> {
         let request = ProcessRequest::new(executable, JAVA_PROBE_TIMEOUT)
             .with_arguments(["-XshowSettings:properties", "-version"])
-            .with_environment(EnvironmentPolicy::CleanJava);
+            .with_environment(EnvironmentPolicy::CleanJava)
+            .with_output_limit(JAVA_PROBE_OUTPUT_LIMIT);
         let output = self.process.run(&request)?;
         if output.exit_code != Some(0) {
             return Err(ProbeError::ExitStatus {
@@ -213,6 +220,14 @@ pub enum ParallelProbeError {
         /// Zero-based worker index.
         worker: usize,
     },
+    /// Candidate input exceeded the bounded discovery/probe contract.
+    #[error("Java probe received {found} candidates, maximum is {maximum}")]
+    TooManyCandidates {
+        /// Candidate count supplied by the caller.
+        found: usize,
+        /// Hard process-level limit.
+        maximum: usize,
+    },
 }
 
 /// Probes candidates with a bounded worker pool and retains only the requested
@@ -238,10 +253,17 @@ where
             rejected: Vec::new(),
         });
     }
+    if candidates.len() > MAX_JAVA_CANDIDATES {
+        return Err(ParallelProbeError::TooManyCandidates {
+            found: candidates.len(),
+            maximum: MAX_JAVA_CANDIDATES,
+        });
+    }
     let workers = parallelism
         .available_parallelism()
         .map_err(|source| ParallelProbeError::AvailableParallelism { source })?
         .get()
+        .min(MAX_JAVA_PROBE_WORKERS)
         .min(candidates.len());
     let queue = Arc::new(Mutex::new(
         candidates.iter().cloned().collect::<VecDeque<_>>(),

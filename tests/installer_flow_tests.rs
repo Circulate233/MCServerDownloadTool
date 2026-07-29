@@ -181,6 +181,7 @@ fn plan(files: Vec<ManifestFile>, runs: Arc<AtomicUsize>) -> (InstallPlan, FakeL
             },
         },
         java_executable: "java".into(),
+        console_helper_executable: "installer".into(),
         java: JavaConfig {
             major: 8,
             min_memory_mb: 1024,
@@ -275,16 +276,22 @@ fn automatic_file_and_loader_are_downloaded_once_and_valid_state_skips_reinstall
     let second = installer
         .install(&manifest_path, &plan, Arc::new(|_| {}))
         .unwrap();
+    fs::write(temp.path().join("cleanroom-1.12.2.jar"), b"corrupted").unwrap();
+    let third = installer
+        .install(&manifest_path, &plan, Arc::new(|_| {}))
+        .unwrap();
 
     assert!(!first.loader_reused);
     assert!(second.loader_reused);
-    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    assert!(!third.loader_reused);
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
     assert_eq!(transfers.load(Ordering::SeqCst), 1);
     assert_eq!(
         fs::read(temp.path().join("mods/automatic.jar")).unwrap(),
         b"automatic"
     );
     assert!(temp.path().join(".mcsdt/install-state.json").is_file());
+    assert!(!temp.path().join(".mcsdt/staging").exists());
 }
 
 #[test]

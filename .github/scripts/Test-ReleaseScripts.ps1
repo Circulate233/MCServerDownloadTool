@@ -7,6 +7,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+& (Join-Path $PSScriptRoot "Test-ActionPins.ps1") -RepositoryRoot $RepositoryRoot
+
 $tagVersion = "7.8.9"
 $tag = "v$tagVersion"
 & (Join-Path $PSScriptRoot "Verify-ReleaseTag.ps1") -Tag $tag -RepositoryRoot $RepositoryRoot

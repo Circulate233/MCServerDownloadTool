@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -34,6 +35,8 @@ pub struct ScriptRequest<'a> {
     pub platform: ScriptPlatform,
     /// Exact Java executable path.
     pub java_executable: &'a Path,
+    /// Exact installer executable path used by the Windows ownership probe.
+    pub console_helper_executable: &'a Path,
     /// Heap sizes and additional JVM arguments.
     pub java: &'a JavaConfig,
     /// Strictly verified loader launch output.
@@ -156,23 +159,48 @@ fn render_windows(request: &ScriptRequest<'_>) -> Result<String, ScriptError> {
         command.push(' ');
         command.push_str(&quote_windows(&argument)?);
     }
-    let mut script = String::from("@echo off\r\nsetlocal DisableDelayedExpansion\r\n");
+    let mut script = String::from(
+        "@echo off\r\nsetlocal DisableDelayedExpansion\r\nfor /f \"tokens=2 delims=:\" %%# in ('chcp') do set \"MCSDT_CODEPAGE=%%#\"\r\nchcp 65001 >nul\r\n",
+    );
     if request.windows_failure == WindowsFailureBehavior::PauseOwnedConsole {
-        script.push_str(
-            "set \"MCSDT_OWNED_CONSOLE=0\"\r\n\
-for /f \"usebackq delims=\" %%# in (`powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$ErrorActionPreference = 'Stop'; $probe = Start-Job -ArgumentList $PID -ScriptBlock { param($probePid) $self = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $probePid); $cmd = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $self.ParentProcessId); if ($cmd.Name -ine 'cmd.exe') { return }; $owner = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $cmd.ParentProcessId); if ($owner.Name -ieq 'explorer.exe') { [Console]::Out.Write('1') } }; if ($null -ne (Wait-Job $probe -Timeout 3)) { Receive-Job $probe }; Stop-Job $probe -ErrorAction SilentlyContinue; Remove-Job $probe -Force -ErrorAction SilentlyContinue\" 2^>nul`) do if \"%%#\"==\"1\" set \"MCSDT_OWNED_CONSOLE=1\"\r\n",
-        );
+        let helper_name = request
+            .console_helper_executable
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| ScriptError::UnsafeArgument {
+                reason: "Windows console helper must have a UTF-8 file name".to_string(),
+            })?;
+        if helper_name.is_empty() || helper_name.contains(['%', '!', '"', '\r', '\n', '\\', '/']) {
+            return Err(ScriptError::UnsafeArgument {
+                reason: "Windows console helper file name contains cmd-unsafe characters"
+                    .to_string(),
+            });
+        }
+        script.push_str("set \"MCSDT_OWNED_CONSOLE=0\"\r\n");
+        write!(
+            script,
+            "set \"MCSDT_HELPER=%~dp0{helper_name}\"\r\n\
+if not exist \"%MCSDT_HELPER%\" (\r\n\
+  echo MCServerDownloadTool console helper is missing: \"%MCSDT_HELPER%\"\r\n\
+  set \"MCSDT_OWNED_CONSOLE=1\"\r\n\
+  set \"MCSDT_EXIT=1\"\r\n\
+  goto :mcsdt_after_launch\r\n\
+)\r\n\
+\"%MCSDT_HELPER%\" --mcsdt-console-owner >nul 2>nul\r\n\
+if not errorlevel 1 set \"MCSDT_OWNED_CONSOLE=1\"\r\n"
+        )
+        .expect("writing to String cannot fail");
     }
     let execution = format!(
-        "for /f \"tokens=2 delims=:\" %%# in ('chcp') do set \"MCSDT_CODEPAGE=%%#\"\r\n\
-chcp 65001 >nul\r\n\
-pushd \"%~dp0\" || exit /b 1\r\n\
+        "pushd \"%~dp0\" || (set \"MCSDT_EXIT=1\" & goto :mcsdt_after_launch)\r\n\
 {command}\r\n\
 set \"MCSDT_EXIT=%ERRORLEVEL%\"\r\n\
-popd\r\n\
-if defined MCSDT_CODEPAGE chcp %MCSDT_CODEPAGE% >nul\r\n"
+popd\r\n"
     );
     script.push_str(&execution);
+    script.push_str(
+        ":mcsdt_after_launch\r\nif defined MCSDT_CODEPAGE chcp %MCSDT_CODEPAGE% >nul\r\n",
+    );
     if request.windows_failure == WindowsFailureBehavior::PauseOwnedConsole {
         script.push_str(
             "if not \"%MCSDT_EXIT%\"==\"0\" if \"%MCSDT_OWNED_CONSOLE%\"==\"1\" pause\r\n",

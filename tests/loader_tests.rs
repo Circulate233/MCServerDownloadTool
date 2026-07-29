@@ -209,6 +209,9 @@ fn observer_failure_terminates_and_reaps_installer_process() {
             "--nocapture".to_string(),
         ],
         working_directory: temp.path().to_path_buf(),
+        timeout: Duration::from_secs(5),
+        max_line_bytes: 64 * 1024,
+        max_stream_bytes: 1024 * 1024,
     };
     let started = Instant::now();
 
@@ -222,6 +225,100 @@ fn observer_failure_terminates_and_reaps_installer_process() {
     assert!(!temp.path().join("loader-child-completed").exists());
 }
 
+fn helper_request(temp: &Path, test: &str) -> ProcessRequest {
+    ProcessRequest {
+        executable: std::env::current_exe().unwrap(),
+        arguments: vec![
+            "--ignored".to_string(),
+            "--exact".to_string(),
+            test.to_string(),
+            "--nocapture".to_string(),
+        ],
+        working_directory: temp.to_path_buf(),
+        timeout: Duration::from_secs(5),
+        max_line_bytes: 64 * 1024,
+        max_stream_bytes: 1024 * 1024,
+    }
+}
+
+#[test]
+fn loader_output_line_limit_terminates_the_process() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut request = helper_request(temp.path(), "loader_oversized_line_child");
+    request.max_line_bytes = 1024;
+
+    let error = SystemProcessRunner
+        .run(&request, Arc::new(|_, _| {}))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        LoaderError::OutputLimit {
+            kind: "line",
+            limit: 1024,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn loader_total_timeout_terminates_the_process() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut request = helper_request(temp.path(), "loader_timeout_child");
+    request.timeout = Duration::from_millis(100);
+    let started = Instant::now();
+
+    let error = SystemProcessRunner
+        .run(&request, Arc::new(|_, _| {}))
+        .unwrap_err();
+
+    assert!(matches!(error, LoaderError::ProcessTimedOut { .. }));
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+#[test]
+fn observer_failure_terminates_installer_descendants() {
+    let temp = tempfile::tempdir().unwrap();
+    let request = helper_request(temp.path(), "loader_descendant_parent");
+    let observer = Arc::new(RejectReadyLine {
+        observed: AtomicBool::new(false),
+    });
+
+    let error = SystemProcessRunner
+        .run(&request, observer.clone())
+        .unwrap_err();
+
+    assert!(matches!(error, LoaderError::Observer { .. }));
+    assert!(observer.observed.load(Ordering::Acquire));
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(!temp.path().join("loader-grandchild-completed").exists());
+}
+
+#[test]
+fn jar_manifest_uncompressed_size_is_bounded_before_parsing() {
+    let temp = tempfile::tempdir().unwrap();
+    let jar = temp.path().join("fabric-server-launch.jar");
+    let file = fs::File::create(&jar).unwrap();
+    let mut archive = zip::ZipWriter::new(file);
+    archive
+        .start_file("META-INF/MANIFEST.MF", SimpleFileOptions::default())
+        .unwrap();
+    archive.write_all(&vec![b'A'; 1024 * 1024 + 1]).unwrap();
+    archive.finish().unwrap();
+
+    let error = verify_loader_output(
+        temp.path(),
+        &LoaderOutputExpectation::ExactJar {
+            path: "fabric-server-launch.jar".into(),
+            main_class: Some("example.Main".to_string()),
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, LoaderError::Jar { .. }));
+    assert!(error.to_string().contains("1048576-byte limit"));
+}
+
 #[test]
 #[ignore = "executed as a child process by observer_failure_terminates_and_reaps_installer_process"]
 fn loader_observer_child() {
@@ -230,4 +327,42 @@ fn loader_observer_child() {
     std::io::stdout().flush().unwrap();
     std::thread::sleep(Duration::from_secs(5));
     fs::write("loader-child-completed", b"completed").unwrap();
+}
+
+#[test]
+#[ignore = "executed as a child process by loader_output_line_limit_terminates_the_process"]
+fn loader_oversized_line_child() {
+    std::io::stdout().write_all(&vec![b'x'; 4096]).unwrap();
+    std::io::stdout().flush().unwrap();
+    std::thread::sleep(Duration::from_secs(5));
+}
+
+#[test]
+#[ignore = "executed as a child process by loader_total_timeout_terminates_the_process"]
+fn loader_timeout_child() {
+    std::thread::sleep(Duration::from_secs(5));
+}
+
+#[test]
+#[ignore = "executed as a child process by observer_failure_terminates_installer_descendants"]
+fn loader_descendant_parent() {
+    let mut grandchild = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "loader_descendant_grandchild",
+            "--nocapture",
+        ])
+        .spawn()
+        .unwrap();
+    println!("loader-child-ready");
+    std::io::stdout().flush().unwrap();
+    grandchild.wait().unwrap();
+}
+
+#[test]
+#[ignore = "executed as a child process by loader_descendant_parent"]
+fn loader_descendant_grandchild() {
+    std::thread::sleep(Duration::from_millis(900));
+    fs::write("loader-grandchild-completed", b"completed").unwrap();
 }

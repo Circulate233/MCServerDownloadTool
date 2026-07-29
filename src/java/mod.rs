@@ -160,10 +160,27 @@ impl InteractiveJavaProvisioner {
 impl JavaRuntimeProvisioner for InteractiveJavaProvisioner {
     type Error = JavaDiscoveryError;
 
-    fn provision(&self, config: &JavaConfig, server_root: &Path) -> Result<PathBuf, Self::Error> {
+    fn provision(
+        &self,
+        config: &JavaConfig,
+        server_root: &Path,
+        preferred: Option<&Path>,
+    ) -> Result<PathBuf, Self::Error> {
         let process = Arc::new(SystemProcessRunner);
         let discovery = SystemCandidateDiscovery::new(Arc::clone(&process));
         let probe = Arc::new(JavaCommandProbe::new(process));
+        if let Some(preferred) = preferred {
+            match validate_preferred_runtime(
+                preferred,
+                config.major,
+                JavaPlatform::current(),
+                self.language,
+                probe.as_ref(),
+            ) {
+                Ok(path) => return Ok(path),
+                Err(reason) => write_diagnostic(&ConsoleIo, self.language, &reason)?,
+            }
+        }
         discover_and_select(
             JavaSelectionRequest {
                 config,
@@ -179,6 +196,32 @@ impl JavaRuntimeProvisioner for InteractiveJavaProvisioner {
     }
 }
 
+fn validate_preferred_runtime<P: RuntimeProbe>(
+    preferred: &Path,
+    required_major: u16,
+    platform: JavaPlatform,
+    language: Language,
+    probe: &P,
+) -> Result<PathBuf, String> {
+    let path = selection::resolve_manual_executable(preferred, platform, language)?;
+    let runtime = probe
+        .inspect(&path)
+        .map_err(|error| Localizer::new(language).java_probe_error(&error))?;
+    if runtime.major != required_major {
+        return Err(match language {
+            Language::EnUs => format!(
+                "saved Java {} does not match required version {required_major}",
+                runtime.major
+            ),
+            Language::ZhCn => format!(
+                "已保存的 Java 主版本 {} 与要求的版本 {required_major} 不匹配",
+                runtime.major
+            ),
+        });
+    }
+    Ok(runtime.executable)
+}
+
 fn write_diagnostic<I: InteractiveIo>(
     io: &I,
     language: Language,
@@ -190,4 +233,79 @@ fn write_diagnostic<I: InteractiveIo>(
             message: localizer.java_diagnostic_output_error(),
             source,
         })
+}
+
+#[cfg(test)]
+mod preferred_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    struct Probe {
+        calls: AtomicUsize,
+        major: u16,
+    }
+
+    impl RuntimeProbe for Probe {
+        fn inspect(&self, executable: &Path) -> Result<JavaRuntime, ProbeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(JavaRuntime {
+                executable: executable.to_path_buf(),
+                version: format!("{}.0.1", self.major),
+                major: self.major,
+                vendor: "test".to_string(),
+                architecture: "x86_64".to_string(),
+            })
+        }
+    }
+
+    fn executable() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join(JavaPlatform::current().executable_name());
+        std::fs::write(&executable, b"java").unwrap();
+        (temp, executable)
+    }
+
+    #[test]
+    fn valid_saved_java_is_probed_once_and_selected_before_discovery() {
+        let (_temp, executable) = executable();
+        let probe = Probe {
+            calls: AtomicUsize::new(0),
+            major: 21,
+        };
+
+        let selected = validate_preferred_runtime(
+            &executable,
+            21,
+            JavaPlatform::current(),
+            Language::EnUs,
+            &probe,
+        )
+        .unwrap();
+
+        assert_eq!(selected, std::fs::canonicalize(executable).unwrap());
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn saved_java_with_wrong_major_is_rejected_after_one_probe() {
+        let (_temp, executable) = executable();
+        let probe = Probe {
+            calls: AtomicUsize::new(0),
+            major: 17,
+        };
+
+        let error = validate_preferred_runtime(
+            &executable,
+            21,
+            JavaPlatform::current(),
+            Language::EnUs,
+            &probe,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("17"));
+        assert!(error.contains("21"));
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+    }
 }

@@ -1,8 +1,10 @@
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::io::Read;
+use std::process::{ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use command_group::{CommandGroup, GroupChild};
 
 use crate::cli::ProxyUrl;
 
@@ -16,31 +18,24 @@ use super::verify::verify_loader_output;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemProcessRunner;
 
+const LOADER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MAX_LOADER_LINE_BYTES: usize = 64 * 1024;
+const MAX_LOADER_STREAM_BYTES: usize = 16 * 1024 * 1024;
+
 impl ProcessRunner for SystemProcessRunner {
     fn run(
         &self,
         request: &ProcessRequest,
         observer: Arc<dyn ProcessObserver>,
     ) -> Result<(), LoaderError> {
-        let mut child = Command::new(&request.executable)
-            .args(&request.arguments)
-            .current_dir(&request.working_directory)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| LoaderError::ProcessIo {
-                operation: "spawn",
-                source,
-            })?;
-        let stdout = child.stdout.take().ok_or_else(|| LoaderError::ProcessIo {
-            operation: "capture stdout",
-            source: std::io::Error::other("spawned process did not expose stdout"),
+        let deadline = Instant::now().checked_add(request.timeout).ok_or_else(|| {
+            LoaderError::InvalidPlan {
+                reason: format!("loader timeout {:?} is not representable", request.timeout),
+            }
         })?;
-        let stderr = child.stderr.take().ok_or_else(|| LoaderError::ProcessIo {
-            operation: "capture stderr",
-            source: std::io::Error::other("spawned process did not expose stderr"),
-        })?;
+        let max_line_bytes = request.max_line_bytes;
+        let max_stream_bytes = request.max_stream_bytes;
+        let (mut child, stdout, stderr) = spawn_process(request)?;
 
         let (failure_sender, failure_receiver) = mpsc::channel();
         let stdout_observer = Arc::clone(&observer);
@@ -51,20 +46,29 @@ impl ProcessRunner for SystemProcessRunner {
                 ProcessStream::Stdout,
                 &stdout_observer,
                 &stdout_sender,
+                max_line_bytes,
+                max_stream_bytes,
             )
         });
         let stderr_worker = thread::spawn(move || {
-            forward_and_report(stderr, ProcessStream::Stderr, &observer, &failure_sender)
+            forward_and_report(
+                stderr,
+                ProcessStream::Stderr,
+                &observer,
+                &failure_sender,
+                max_line_bytes,
+                max_stream_bytes,
+            )
         });
         let status = loop {
             match failure_receiver.recv_timeout(Duration::from_millis(10)) {
                 Ok(failure) => {
-                    terminate_child(&mut child)?;
+                    let cleanup_error = terminate_child(&mut child);
                     let stdout_result = join_forwarder(stdout_worker);
                     let stderr_result = join_forwarder(stderr_worker);
-                    stdout_result?;
-                    stderr_result?;
-                    return Err(failure.into_loader_error());
+                    let _ = stdout_result;
+                    let _ = stderr_result;
+                    return Err(failure.into_loader_error(cleanup_error));
                 }
                 Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {}
             }
@@ -73,6 +77,15 @@ impl ProcessRunner for SystemProcessRunner {
                 source,
             })? {
                 break status;
+            }
+            if Instant::now() >= deadline {
+                let cleanup_error = terminate_child(&mut child);
+                let _ = join_forwarder(stdout_worker);
+                let _ = join_forwarder(stderr_worker);
+                return Err(LoaderError::ProcessTimedOut {
+                    timeout: request.timeout,
+                    cleanup_error,
+                });
             }
         };
         join_forwarder(stdout_worker)?;
@@ -86,15 +99,96 @@ impl ProcessRunner for SystemProcessRunner {
     }
 }
 
+fn spawn_process(
+    request: &ProcessRequest,
+) -> Result<(GroupChild, ChildStdout, ChildStderr), LoaderError> {
+    let mut command = Command::new(&request.executable);
+    command
+        .args(&request.arguments)
+        .current_dir(&request.working_directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for variable in [
+        "_JAVA_OPTIONS",
+        "JAVA_TOOL_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "CLASSPATH",
+    ] {
+        command.env_remove(variable);
+    }
+    let mut child = command
+        .group_spawn()
+        .map_err(|source| LoaderError::ProcessIo {
+            operation: "spawn",
+            source,
+        })?;
+    let stdout = child
+        .inner()
+        .stdout
+        .take()
+        .ok_or_else(|| LoaderError::ProcessIo {
+            operation: "capture stdout",
+            source: std::io::Error::other("spawned process did not expose stdout"),
+        })?;
+    let stderr = child
+        .inner()
+        .stderr
+        .take()
+        .ok_or_else(|| LoaderError::ProcessIo {
+            operation: "capture stderr",
+            source: std::io::Error::other("spawned process did not expose stderr"),
+        })?;
+    Ok((child, stdout, stderr))
+}
+
 fn forward_lines(
-    stream: impl std::io::Read,
+    mut stream: impl Read,
     kind: ProcessStream,
     observer: &Arc<dyn ProcessObserver>,
+    max_line_bytes: usize,
+    max_stream_bytes: usize,
 ) -> Result<(), ForwardFailure> {
-    for line in BufReader::new(stream).lines() {
-        let line = line.map_err(|error| ForwardFailure::from_io(&error))?;
+    let mut chunk = [0_u8; 16 * 1024];
+    let mut line = Vec::new();
+    let mut total = 0_usize;
+    loop {
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|error| ForwardFailure::from_io(&error))?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read);
+        if total > max_stream_bytes {
+            return Err(ForwardFailure::Limit {
+                kind: "stream",
+                limit: max_stream_bytes,
+            });
+        }
+        for byte in &chunk[..read] {
+            if *byte == b'\n' {
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                observer
+                    .line(kind, String::from_utf8_lossy(&line).into_owned())
+                    .map_err(ForwardFailure::Observer)?;
+                line.clear();
+            } else {
+                line.push(*byte);
+                if line.len() > max_line_bytes {
+                    return Err(ForwardFailure::Limit {
+                        kind: "line",
+                        limit: max_line_bytes,
+                    });
+                }
+            }
+        }
+    }
+    if !line.is_empty() {
         observer
-            .line(kind, line)
+            .line(kind, String::from_utf8_lossy(&line).into_owned())
             .map_err(ForwardFailure::Observer)?;
     }
     Ok(())
@@ -105,8 +199,10 @@ fn forward_and_report(
     kind: ProcessStream,
     observer: &Arc<dyn ProcessObserver>,
     failure_sender: &mpsc::Sender<ForwardFailure>,
+    max_line_bytes: usize,
+    max_stream_bytes: usize,
 ) -> Result<(), ForwardFailure> {
-    let result = forward_lines(stream, kind, observer);
+    let result = forward_lines(stream, kind, observer, max_line_bytes, max_stream_bytes);
     if let Err(error) = &result
         && failure_sender.send(error.clone()).is_err()
     {
@@ -124,25 +220,17 @@ fn join_forwarder(
             operation: "join output forwarding thread",
             source: std::io::Error::other("output forwarding thread panicked"),
         })?
-        .map_err(ForwardFailure::into_loader_error)
+        .map_err(|failure| failure.into_loader_error(None))
 }
 
-fn terminate_child(child: &mut std::process::Child) -> Result<(), LoaderError> {
-    match child.kill() {
-        Ok(()) => child
-            .wait()
-            .map(|_| ())
-            .map_err(|source| LoaderError::ProcessIo {
-                operation: "reap terminated",
-                source,
-            }),
-        Err(kill_error) => match child.try_wait() {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) | Err(_) => Err(LoaderError::ProcessIo {
-                operation: "terminate after output observer failure for",
-                source: kill_error,
-            }),
-        },
+fn terminate_child(child: &mut GroupChild) -> Option<String> {
+    let kill = child.kill().err().map(|error| error.to_string());
+    let wait = child.wait().err().map(|error| error.to_string());
+    match (kill, wait) {
+        (None, None) => None,
+        (Some(kill), None) => Some(format!("terminate failed: {kill}")),
+        (None, Some(wait)) => Some(format!("reap failed: {wait}")),
+        (Some(kill), Some(wait)) => Some(format!("terminate failed: {kill}; reap failed: {wait}")),
     }
 }
 
@@ -153,6 +241,10 @@ enum ForwardFailure {
         reason: String,
     },
     Observer(ProcessObserverError),
+    Limit {
+        kind: &'static str,
+        limit: usize,
+    },
 }
 
 impl ForwardFailure {
@@ -163,13 +255,19 @@ impl ForwardFailure {
         }
     }
 
-    fn into_loader_error(self) -> LoaderError {
+    fn into_loader_error(self, cleanup_error: Option<String>) -> LoaderError {
         match self {
             Self::Read { kind, reason } => LoaderError::ProcessIo {
                 operation: "stream output from",
                 source: std::io::Error::new(kind, reason),
             },
             Self::Observer(source) => LoaderError::Observer { source },
+            Self::Limit { kind, limit } => LoaderError::OutputLimit {
+                stream: "stdout/stderr",
+                kind,
+                limit,
+                cleanup_error,
+            },
         }
     }
 }
@@ -221,6 +319,9 @@ impl<R: ProcessRunner> LoaderInstallation for LoaderExecutor<R> {
                 executable: java_executable.to_path_buf(),
                 arguments,
                 working_directory: server_root.to_path_buf(),
+                timeout: LOADER_TIMEOUT,
+                max_line_bytes: MAX_LOADER_LINE_BYTES,
+                max_stream_bytes: MAX_LOADER_STREAM_BYTES,
             },
             observer,
         )?;

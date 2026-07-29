@@ -4,11 +4,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(windows)]
+use std::io::Write;
+#[cfg(windows)]
 use std::process::{Child, ExitStatus, Stdio};
 #[cfg(windows)]
 use std::thread;
 #[cfg(windows)]
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+const INVOCATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 use mc_server_download_tool::loader::VerifiedLaunch;
 use mc_server_download_tool::manifest::JavaConfig;
@@ -196,8 +201,6 @@ fn main() {
 
 #[cfg(windows)]
 fn assert_owned_windows_console_pauses(server_root: &Path, capture: &Path, explorer_parent: &Path) {
-    use std::io::Write;
-
     let mut owned = Command::new(explorer_parent)
         .current_dir(server_root)
         .env("MCSDT_FAKE_CAPTURE", capture)
@@ -215,8 +218,40 @@ fn assert_owned_windows_console_pauses(server_root: &Path, capture: &Path, explo
     );
     owned.stdin.take().unwrap().write_all(b"x").unwrap();
     assert_eq!(
-        wait_without_hanging(owned, Duration::from_secs(5), "Explorer-owned invocation").code(),
+        wait_without_hanging(owned, INVOCATION_TIMEOUT, "Explorer-owned invocation").code(),
         Some(41)
+    );
+}
+
+#[cfg(windows)]
+fn assert_missing_windows_helper_pauses(server_root: &Path, explorer_parent: &Path, helper: &str) {
+    fs::remove_file(server_root.join(helper)).unwrap();
+    let mut missing_helper = Command::new(explorer_parent)
+        .current_dir(server_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(400));
+    assert!(
+        missing_helper.try_wait().unwrap().is_none(),
+        "an Explorer-owned missing helper failure must wait for a key"
+    );
+    missing_helper
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"x")
+        .unwrap();
+    assert_eq!(
+        wait_without_hanging(
+            missing_helper,
+            INVOCATION_TIMEOUT,
+            "missing Windows helper invocation"
+        )
+        .code(),
+        Some(1)
     );
 }
 
@@ -235,6 +270,7 @@ fn modified_script_is_preserved_and_complete_replacement_is_published() {
     let request = ScriptRequest {
         platform: ScriptPlatform::Windows,
         java_executable: Path::new("C:/Java/bin/java.exe"),
+        console_helper_executable: Path::new("C:/MCServerDownloadTool/installer.exe"),
         java: &java,
         launch: &launch,
         windows_failure: WindowsFailureBehavior::PauseOwnedConsole,
@@ -268,6 +304,20 @@ fn windows_script_executes_special_paths_and_applies_console_ownership_behavior(
         &java_root,
         "fake Java 中文!%&.exe",
     );
+    let console_helper_directory = temp.path().join("安装器 目录!%&");
+    fs::create_dir_all(&console_helper_directory).unwrap();
+    let console_helper_name = "MCServerDownloadTool-test.exe";
+    let console_helper = console_helper_directory.join(console_helper_name);
+    fs::copy(
+        env!("CARGO_BIN_EXE_mc-server-download-tool"),
+        server_root.join(console_helper_name),
+    )
+    .unwrap();
+    let _shadow_console_helper = compile_fake_java(
+        &temp.path().join("console-helper-build"),
+        &console_helper_directory,
+        console_helper_name,
+    );
     let explorer_parent = compile_explorer_parent(&temp.path().join("explorer helper"));
     let capture = temp.path().join("captured arguments.txt");
     let java = JavaConfig {
@@ -285,6 +335,7 @@ fn windows_script_executes_special_paths_and_applies_console_ownership_behavior(
         &ScriptRequest {
             platform: ScriptPlatform::Windows,
             java_executable: &fake_java,
+            console_helper_executable: &console_helper,
             java: &java,
             launch: &launch,
             windows_failure: WindowsFailureBehavior::PauseOwnedConsole,
@@ -302,7 +353,7 @@ fn windows_script_executes_special_paths_and_applies_console_ownership_behavior(
     assert_eq!(
         wait_without_hanging(
             success,
-            Duration::from_secs(5),
+            INVOCATION_TIMEOUT,
             "successful interactive invocation"
         )
         .code(),
@@ -314,7 +365,7 @@ fn windows_script_executes_special_paths_and_applies_console_ownership_behavior(
     assert_eq!(
         wait_without_hanging(
             failure,
-            Duration::from_secs(5),
+            INVOCATION_TIMEOUT,
             "failing interactive invocation"
         )
         .code(),
@@ -326,7 +377,7 @@ fn windows_script_executes_special_paths_and_applies_console_ownership_behavior(
     assert_eq!(
         wait_without_hanging(
             cmd_failure,
-            Duration::from_secs(5),
+            INVOCATION_TIMEOUT,
             "ordinary cmd /c invocation"
         )
         .code(),
@@ -338,7 +389,7 @@ fn windows_script_executes_special_paths_and_applies_console_ownership_behavior(
     assert_eq!(
         wait_without_hanging(
             powershell_failure,
-            Duration::from_secs(5),
+            INVOCATION_TIMEOUT,
             "PowerShell invocation",
         )
         .code(),
@@ -347,6 +398,8 @@ fn windows_script_executes_special_paths_and_applies_console_ownership_behavior(
     );
 
     assert_owned_windows_console_pauses(&server_root, &capture, &explorer_parent);
+
+    assert_missing_windows_helper_pauses(&server_root, &explorer_parent, console_helper_name);
 }
 
 #[cfg(unix)]
@@ -378,6 +431,7 @@ fn unix_script_preserves_shell_arguments_working_directory_and_exit_status() {
         &ScriptRequest {
             platform: ScriptPlatform::Unix,
             java_executable: &fake_java,
+            console_helper_executable: Path::new("/unused/installer"),
             java: &java,
             launch: &launch,
             windows_failure: WindowsFailureBehavior::Return,

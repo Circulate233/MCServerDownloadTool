@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use mc_server_download_tool::i18n::Language;
 use mc_server_download_tool::install::{
-    InstallError, InstallEvent, InstallObserverError, InstallRoot, InstallSession,
+    InstallError, InstallEvent, InstallObserverError, InstallRoot, InstallSession, InstallStage,
 };
 use mc_server_download_tool::loader::ProcessStream;
+use mc_server_download_tool::net::{TransferEvent, TransferPhase};
 
 fn manifest(root: &Path) -> std::path::PathBuf {
     let path = root.join("server-install.json");
@@ -124,7 +125,98 @@ fn log_creation_failure_aborts_before_installation_work() {
         std::iter::empty(),
     );
 
-    assert!(matches!(result, Err(InstallError::Io { .. })));
+    assert!(matches!(result, Err(InstallError::UnsafePath { .. })));
+}
+
+#[test]
+fn session_rejects_hardlinked_log_without_modifying_the_other_name() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let manifest = manifest(root.path());
+    fs::create_dir(root.path().join(".mcsdt")).unwrap();
+    let protected = outside.path().join("protected.txt");
+    fs::write(&protected, b"do-not-touch").unwrap();
+    fs::hard_link(&protected, root.path().join(".mcsdt/install.log")).unwrap();
+
+    let result = InstallSession::acquire(
+        &manifest,
+        Language::EnUs,
+        Arc::new(|_| {}),
+        std::iter::empty(),
+    );
+
+    assert!(matches!(result, Err(InstallError::UnsafePath { .. })));
+    assert_eq!(fs::read(protected).unwrap(), b"do-not-touch");
+}
+
+fn progress(task: &str, phase: TransferPhase, bytes: u64) -> InstallEvent {
+    InstallEvent::Transfer(TransferEvent {
+        task_id: task.to_string(),
+        phase,
+        transferred_bytes: bytes,
+        total_bytes: Some(100),
+        active_requests: 1,
+        bytes_per_second: 1.0,
+    })
+}
+
+#[test]
+fn session_log_coalesces_progress_but_keeps_phase_changes_and_terminal_event() {
+    let root = tempfile::tempdir().unwrap();
+    let manifest = manifest(root.path());
+    let session = InstallSession::acquire(
+        &manifest,
+        Language::EnUs,
+        Arc::new(|_| {}),
+        std::iter::empty(),
+    )
+    .unwrap();
+    let observer = session.observer();
+    for bytes in 0..100 {
+        observer
+            .observe(progress("loader", TransferPhase::Single, bytes))
+            .unwrap();
+    }
+    observer
+        .observe(progress("loader", TransferPhase::Verifying, 100))
+        .unwrap();
+    observer
+        .observe(progress("loader", TransferPhase::Completed, 100))
+        .unwrap();
+    session.check_log().unwrap();
+
+    let log = fs::read_to_string(root.path().join(".mcsdt/install.log")).unwrap();
+    let lines = log
+        .lines()
+        .filter(|line| line.contains("download loader:"))
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3);
+    assert!(lines.iter().any(|line| line.contains("receiving")));
+    assert!(lines.iter().any(|line| line.contains("verifying")));
+    assert!(lines.iter().any(|line| line.contains("completed")));
+}
+
+#[test]
+fn stage_and_failure_records_are_durable_before_session_drop() {
+    let root = tempfile::tempdir().unwrap();
+    let manifest = manifest(root.path());
+    let session = InstallSession::acquire(
+        &manifest,
+        Language::EnUs,
+        Arc::new(|_| {}),
+        std::iter::empty(),
+    )
+    .unwrap();
+
+    session
+        .emit(InstallEvent::Stage(InstallStage::Downloading))
+        .unwrap();
+    let after_stage = fs::read_to_string(root.path().join(".mcsdt/install.log")).unwrap();
+    assert!(after_stage.contains("downloading required artifacts"));
+
+    session.record_failure("injected durable failure").unwrap();
+    let after_failure = fs::read_to_string(root.path().join(".mcsdt/install.log")).unwrap();
+    assert!(after_failure.contains("injected durable failure"));
 }
 
 #[cfg(unix)]

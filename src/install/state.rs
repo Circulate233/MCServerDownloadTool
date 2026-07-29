@@ -1,12 +1,21 @@
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::loader::VerifiedLaunch;
 
 use super::atomic;
+
+/// Content identity for one final loader output used by idempotent reuse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledArtifact {
+    pub path: PathBuf,
+    pub size: u64,
+    pub sha256: String,
+}
 
 /// Durable inputs and verified outputs used for idempotent installation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,12 +29,20 @@ pub struct InstallState {
     pub loader_plan_sha256: String,
     /// Strictly verified launch output from the loader installer.
     pub loader_output: VerifiedLaunch,
+    /// Exact size and SHA-256 of every final loader output.
+    pub loader_artifacts: Vec<InstalledArtifact>,
     /// SHA-256 of the last start script published at its primary path.
     pub script_sha256: String,
 }
 
 impl InstallState {
-    pub(crate) fn load(path: &Path) -> io::Result<Option<Self>> {
+    /// Loads a previously persisted installation state, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the file cannot be read or its JSON does not
+    /// match the installation state schema.
+    pub fn load(path: &Path) -> io::Result<Option<Self>> {
         match fs::read(path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map(Some)

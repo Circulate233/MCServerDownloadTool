@@ -30,5 +30,10 @@ pub trait JavaRuntimeProvisioner {
     ///
     /// Returns the implementation's discovery or provisioning error when no
     /// matching Java runtime can be made available.
-    fn provision(&self, config: &JavaConfig, server_root: &Path) -> Result<PathBuf, Self::Error>;
+    fn provision(
+        &self,
+        config: &JavaConfig,
+        server_root: &Path,
+        preferred: Option<&Path>,
+    ) -> Result<PathBuf, Self::Error>;
 }

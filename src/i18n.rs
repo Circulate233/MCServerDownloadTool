@@ -265,6 +265,12 @@ impl Localizer {
     #[must_use]
     pub fn java_parallel_probe_error(self, error: &ParallelProbeError) -> String {
         match (self.language, error) {
+            (Language::EnUs, ParallelProbeError::TooManyCandidates { found, maximum }) => format!(
+                "Java discovery returned {found} candidates, exceeding the safe limit of {maximum}. Reduce configured Java search locations"
+            ),
+            (Language::ZhCn, ParallelProbeError::TooManyCandidates { found, maximum }) => format!(
+                "Java 发现返回了 {found} 个候选，超过安全上限 {maximum}。请减少配置的 Java 搜索位置"
+            ),
             (Language::EnUs, ParallelProbeError::AvailableParallelism { source }) => format!(
                 "could not determine Java probe parallelism: {source}. Check operating-system resource limits"
             ),
@@ -387,6 +393,20 @@ impl Localizer {
                 program,
                 source,
             ),
+            ProcessError::OutputLimit {
+                program,
+                stream,
+                limit,
+            } => match language {
+                Language::EnUs => format!(
+                    "Java '{}' produced more than {limit} bytes on {stream} and was terminated",
+                    program.display()
+                ),
+                Language::ZhCn => format!(
+                    "Java“{}”的 {stream} 输出超过 {limit} 字节，进程已终止",
+                    program.display()
+                ),
+            },
             ProcessError::ReaderPanic { program, stream } => match language {
                 Language::EnUs => format!(
                     "{stream} reader stopped unexpectedly for Java '{}'",

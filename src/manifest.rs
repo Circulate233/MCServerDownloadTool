@@ -12,6 +12,20 @@ use crate::loader::LoaderOutputExpectation;
 /// The only manifest schema version understood by this release.
 pub const SCHEMA_VERSION: u32 = 1;
 
+const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_FILES: usize = 20_000;
+const MAX_ARGUMENTS: usize = 512;
+const MAX_ARGUMENT_BYTES: usize = 8 * 1024;
+const MAX_NAME_BYTES: usize = 512;
+const MAX_VERSION_BYTES: usize = 128;
+const MAX_PATH_BYTES: usize = 1024;
+const MAX_URL_BYTES: usize = 4096;
+const MAX_API_KEY_BYTES: usize = 4096;
+const MAX_LOADER_INSTALLER_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_MANIFEST_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const FORGE_CDN_ORIGIN: &str = "edge.forgecdn.net";
+const CURSEFORGE_ORIGIN: &str = "www.curseforge.com";
+
 /// Complete schema-version-one server installation manifest.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,6 +67,13 @@ impl Manifest {
     /// Returns [`ManifestError::Parse`] for malformed shape and
     /// [`ManifestError::Validation`] for the first semantic violation.
     pub fn from_slice(bytes: &[u8]) -> Result<ValidatedManifest, ManifestError> {
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_MANIFEST_BYTES {
+            return Err(ManifestValidationError::InvalidField {
+                field: "manifest".to_string(),
+                reason: format!("must not exceed {MAX_MANIFEST_BYTES} bytes"),
+            }
+            .into());
+        }
         let manifest: Self =
             serde_json::from_slice(bytes).map_err(|source| ManifestError::Parse {
                 origin: "<memory>".to_string(),
@@ -72,9 +93,17 @@ impl Manifest {
                 found: self.schema_version,
             });
         }
-        validate_non_blank("minecraft.version", &self.minecraft.version)?;
+        validate_minecraft_version("minecraft.version", &self.minecraft.version)?;
         self.java.validate()?;
         self.loader.validate()?;
+        validate_loader_contract(&self.loader, &self.minecraft.version)?;
+
+        if self.files.len() > MAX_FILES {
+            return invalid(
+                "files",
+                &format!("must contain at most {MAX_FILES} entries"),
+            );
+        }
 
         let mut targets = FinalTargetSet::with_capacity(self.files.len() + 2);
         register_loader_output_targets(&self.loader.output, &mut targets)?;
@@ -86,6 +115,7 @@ impl Manifest {
         }
         if let Some(key) = &self.curseforge_api_key {
             validate_non_blank("curseforge_api_key", key.expose())?;
+            validate_max_bytes("curseforge_api_key", key.expose(), MAX_API_KEY_BYTES)?;
             if key.expose().contains(['\r', '\n', '\0']) {
                 return invalid("curseforge_api_key", "NUL and line breaks are forbidden");
             }
@@ -250,6 +280,12 @@ impl JavaConfig {
                 "must be positive and no greater than java.max_memory_mb",
             );
         }
+        if self.jvm_args.len() > MAX_ARGUMENTS || self.server_args.len() > MAX_ARGUMENTS {
+            return invalid(
+                "java",
+                &format!("each argument array may contain at most {MAX_ARGUMENTS} entries"),
+            );
+        }
         validate_arguments("java.jvm_args", &self.jvm_args)?;
         validate_arguments("java.server_args", &self.server_args)
     }
@@ -271,7 +307,7 @@ pub struct LoaderConfig {
 
 impl LoaderConfig {
     fn validate(&self) -> Result<(), ManifestValidationError> {
-        validate_non_blank("loader.version", &self.version)?;
+        validate_maven_segment("loader.version", &self.version)?;
         self.installer.validate()?;
         validate_loader_output(self.kind, &self.output)
     }
@@ -310,15 +346,23 @@ pub struct LoaderInstaller {
 
 impl LoaderInstaller {
     fn validate(&self) -> Result<(), ManifestValidationError> {
-        let installer = validate_https_url("loader.installer.url", &self.url)?;
+        validate_max_bytes("loader.installer.url", &self.url, MAX_URL_BYTES)?;
+        let installer = validate_strict_https_url("loader.installer.url", &self.url)?;
         match (&self.sha1, &self.sha1_sidecar) {
             (Some(sha1), None) => validate_sha1("loader.installer.sha1", sha1)?,
             (None, Some(sidecar)) => {
-                let sidecar = validate_https_url("loader.installer.sha1_sidecar", sidecar)?;
+                validate_max_bytes("loader.installer.sha1_sidecar", sidecar, MAX_URL_BYTES)?;
+                let sidecar = validate_strict_https_url("loader.installer.sha1_sidecar", sidecar)?;
                 if origin(&installer) != origin(&sidecar) {
                     return invalid(
                         "loader.installer.sha1_sidecar",
                         "must use the same origin as loader.installer.url",
+                    );
+                }
+                if sidecar.as_str() != format!("{}.sha1", installer.as_str()) {
+                    return invalid(
+                        "loader.installer.sha1_sidecar",
+                        "must be the exact installer URL with a .sha1 suffix",
                     );
                 }
             }
@@ -329,8 +373,14 @@ impl LoaderInstaller {
                 );
             }
         }
-        if self.size == Some(0) {
-            return invalid("loader.installer.size", "must be greater than zero");
+        if self
+            .size
+            .is_some_and(|size| size == 0 || size > MAX_LOADER_INSTALLER_BYTES)
+        {
+            return invalid(
+                "loader.installer.size",
+                &format!("must be between 1 and {MAX_LOADER_INSTALLER_BYTES} bytes when present"),
+            );
         }
         let file_name = self.file_name()?;
         if !file_name.to_ascii_lowercase().ends_with(".jar") {
@@ -345,7 +395,7 @@ impl LoaderInstaller {
     ///
     /// Returns a manifest validation error when the URL has no safe final path segment.
     pub fn file_name(&self) -> Result<String, ManifestValidationError> {
-        let url = validate_https_url("loader.installer.url", &self.url)?;
+        let url = validate_strict_https_url("loader.installer.url", &self.url)?;
         let name = url
             .path_segments()
             .and_then(Iterator::last)
@@ -387,10 +437,7 @@ pub enum FileDownload {
 impl FileDownload {
     fn validate(&self, field: &str) -> Result<(), ManifestValidationError> {
         match self {
-            Self::Automatic { url } => {
-                validate_https_url(&format!("{field}.url"), url)?;
-                Ok(())
-            }
+            Self::Automatic { url } => validate_forgecdn_url(&format!("{field}.url"), url),
             Self::Manual => Ok(()),
         }
     }
@@ -401,8 +448,7 @@ impl FileDownload {
         };
         Url::parse(url)
             .ok()
-            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-            .is_some_and(|host| host == "forgecdn.net" || host.ends_with(".forgecdn.net"))
+            .is_some_and(|url| exact_https_origin(&url, FORGE_CDN_ORIGIN))
     }
 }
 
@@ -429,14 +475,22 @@ pub struct ManifestFile {
 
 impl ManifestFile {
     fn validate(&self, index: usize) -> Result<(), ManifestValidationError> {
-        validate_non_blank(&format!("files[{index}].name"), &self.name)?;
+        let name_field = format!("files[{index}].name");
+        validate_bounded_text(&name_field, &self.name, MAX_NAME_BYTES)?;
         validate_path(&format!("files[{index}].path"), &self.path, true)?;
         self.download
             .validate(&format!("files[{index}].download"))?;
-        validate_https_url(&format!("files[{index}].project_page"), &self.project_page)?;
+        validate_project_page(
+            &format!("files[{index}].project_page"),
+            &self.project_page,
+            self.kind,
+        )?;
         validate_sha1(&format!("files[{index}].sha1"), &self.sha1)?;
-        if self.size == 0 {
-            return invalid(&format!("files[{index}].size"), "must be greater than zero");
+        if self.size == 0 || self.size > MAX_MANIFEST_FILE_BYTES {
+            return invalid(
+                &format!("files[{index}].size"),
+                &format!("must be between 1 and {MAX_MANIFEST_FILE_BYTES} bytes"),
+            );
         }
         Ok(())
     }
@@ -448,6 +502,24 @@ impl ManifestFile {
 ///
 /// Returns a read, parse, or semantic validation error with the selected path.
 pub fn load_manifest(path: &Path) -> Result<ValidatedManifest, ManifestError> {
+    let metadata = fs::metadata(path).map_err(|source| ManifestError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(ManifestValidationError::InvalidField {
+            field: "manifest".to_string(),
+            reason: "must be a regular file".to_string(),
+        }
+        .into());
+    }
+    if metadata.len() > MAX_MANIFEST_BYTES {
+        return Err(ManifestValidationError::InvalidField {
+            field: "manifest".to_string(),
+            reason: format!("must not exceed {MAX_MANIFEST_BYTES} bytes"),
+        }
+        .into());
+    }
     let bytes = fs::read(path).map_err(|source| ManifestError::Read {
         path: path.to_path_buf(),
         source,
@@ -464,6 +536,7 @@ fn validate_arguments(field: &str, arguments: &[String]) -> Result<(), ManifestV
     for (index, argument) in arguments.iter().enumerate() {
         let item = format!("{field}[{index}]");
         validate_non_blank(&item, argument)?;
+        validate_max_bytes(&item, argument, MAX_ARGUMENT_BYTES)?;
         if argument.contains(['\r', '\n', '\0']) {
             return invalid(&item, "NUL and line breaks are forbidden");
         }
@@ -528,6 +601,67 @@ fn validate_non_blank(field: &str, value: &str) -> Result<(), ManifestValidation
     Ok(())
 }
 
+fn validate_bounded_text(
+    field: &str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), ManifestValidationError> {
+    validate_non_blank(field, value)?;
+    validate_max_bytes(field, value, max_bytes)?;
+    if value.chars().any(char::is_control) {
+        return invalid(field, "control characters are forbidden");
+    }
+    Ok(())
+}
+
+fn validate_max_bytes(
+    field: &str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), ManifestValidationError> {
+    if value.len() > max_bytes {
+        return invalid(field, &format!("must not exceed {max_bytes} UTF-8 bytes"));
+    }
+    Ok(())
+}
+
+fn validate_minecraft_version(field: &str, value: &str) -> Result<(), ManifestValidationError> {
+    validate_max_bytes(field, value, MAX_VERSION_BYTES)?;
+    let components = value.split('.').collect::<Vec<_>>();
+    if !(2..=3).contains(&components.len())
+        || components.iter().any(|component| {
+            component.is_empty()
+                || !component.bytes().all(|byte| byte.is_ascii_digit())
+                || (component.len() > 1 && component.starts_with('0'))
+        })
+        || components[0] != "1"
+    {
+        return invalid(
+            field,
+            "must use the numeric form 1.<minor> or 1.<minor>.<patch>",
+        );
+    }
+    Ok(())
+}
+
+fn validate_maven_segment(field: &str, value: &str) -> Result<(), ManifestValidationError> {
+    validate_max_bytes(field, value, MAX_VERSION_BYTES)?;
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains("..")
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+'))
+    {
+        return invalid(
+            field,
+            "must be one safe Maven path segment containing only ASCII letters, digits, '.', '-', '_', or '+'",
+        );
+    }
+    Ok(())
+}
+
 fn validate_sha1(field: &str, value: &str) -> Result<(), ManifestValidationError> {
     if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return invalid(
@@ -538,7 +672,7 @@ fn validate_sha1(field: &str, value: &str) -> Result<(), ManifestValidationError
     Ok(())
 }
 
-fn validate_https_url(field: &str, value: &str) -> Result<Url, ManifestValidationError> {
+fn validate_strict_https_url(field: &str, value: &str) -> Result<Url, ManifestValidationError> {
     if !value
         .split_once("://")
         .is_some_and(|(_, authority)| !authority.is_empty() && !authority.starts_with('/'))
@@ -555,10 +689,251 @@ fn validate_https_url(field: &str, value: &str) -> Result<Url, ManifestValidatio
     if !url.username().is_empty() || url.password().is_some() {
         return invalid(field, "URL credentials are forbidden");
     }
-    if url.fragment().is_some() {
-        return invalid(field, "URL fragments are forbidden");
+    if url.port().is_some() || url.query().is_some() || url.fragment().is_some() {
+        return invalid(
+            field,
+            "explicit ports, queries, and fragments are forbidden",
+        );
     }
     Ok(url)
+}
+
+fn exact_https_origin(url: &Url, host: &str) -> bool {
+    url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case(host))
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
+fn validate_forgecdn_url(field: &str, value: &str) -> Result<(), ManifestValidationError> {
+    validate_max_bytes(field, value, MAX_URL_BYTES)?;
+    let url = validate_strict_https_url(field, value)?;
+    if !exact_https_origin(&url, FORGE_CDN_ORIGIN) {
+        return invalid(field, "must use the exact https://edge.forgecdn.net origin");
+    }
+    let segments = url
+        .path_segments()
+        .map(Iterator::collect::<Vec<_>>)
+        .unwrap_or_default();
+    if segments.len() != 4
+        || segments[0] != "files"
+        || !is_decimal_id(segments[1])
+        || !is_decimal_id(segments[2])
+        || !is_safe_url_filename(segments[3])
+    {
+        return invalid(field, "must match /files/<id>/<subId>/<filename>");
+    }
+    Ok(())
+}
+
+fn validate_project_page(
+    field: &str,
+    value: &str,
+    kind: FileKind,
+) -> Result<(), ManifestValidationError> {
+    validate_max_bytes(field, value, MAX_URL_BYTES)?;
+    let url = validate_strict_https_url(field, value)?;
+    if !exact_https_origin(&url, CURSEFORGE_ORIGIN) {
+        return invalid(
+            field,
+            "must use the exact https://www.curseforge.com origin",
+        );
+    }
+    let expected_kind = match kind {
+        FileKind::Mod => "mc-mods",
+        FileKind::ResourcePack => "texture-packs",
+        FileKind::ShaderPack => "shaders",
+    };
+    let segments = url
+        .path_segments()
+        .map(Iterator::collect::<Vec<_>>)
+        .unwrap_or_default();
+    if segments.len() != 5
+        || segments[0] != "minecraft"
+        || segments[1] != expected_kind
+        || !is_curseforge_slug(segments[2])
+        || segments[3] != "files"
+        || !is_decimal_id(segments[4])
+    {
+        return invalid(
+            field,
+            &format!("must match /minecraft/{expected_kind}/<slug>/files/<fileId>"),
+        );
+    }
+    Ok(())
+}
+
+fn is_decimal_id(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_curseforge_slug(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_NAME_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn is_safe_url_filename(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    !value.is_empty()
+        && value.len() <= MAX_PATH_BYTES
+        && value != "."
+        && value != ".."
+        && !lower.contains("%2f")
+        && !lower.contains("%5c")
+        && !value.chars().any(char::is_control)
+}
+
+fn validate_loader_contract(
+    loader: &LoaderConfig,
+    minecraft_version: &str,
+) -> Result<(), ManifestValidationError> {
+    let expected_url = match loader.kind {
+        LoaderKind::Forge => format!(
+            "https://maven.minecraftforge.net/net/minecraftforge/forge/{minecraft_version}-{0}/forge-{minecraft_version}-{0}-installer.jar",
+            loader.version
+        ),
+        LoaderKind::NeoForge => format!(
+            "https://maven.neoforged.net/releases/net/neoforged/neoforge/{0}/neoforge-{0}-installer.jar",
+            loader.version
+        ),
+        LoaderKind::Cleanroom => {
+            let github = format!(
+                "https://github.com/CleanroomMC/Cleanroom/releases/download/{0}/cleanroom-{0}-installer.jar",
+                loader.version
+            );
+            let repository = if loader.version.to_ascii_lowercase().contains("snapshot") {
+                "snapshots"
+            } else {
+                "releases"
+            };
+            let maven = format!(
+                "https://repo.cleanroommc.com/{repository}/com/cleanroommc/cleanroom/{0}/cleanroom-{0}-installer.jar",
+                loader.version
+            );
+            if loader.installer.url == github || loader.installer.url == maven {
+                loader.installer.url.clone()
+            } else {
+                return invalid(
+                    "loader.installer.url",
+                    "must be the exact official Cleanroom GitHub Release or Maven installer URL",
+                );
+            }
+        }
+        LoaderKind::Fabric => validate_fabric_installer_url(&loader.installer.url)?,
+    };
+    if loader.installer.url != expected_url {
+        return invalid(
+            "loader.installer.url",
+            &format!(
+                "does not match the exact official {:?} installer coordinate",
+                loader.kind
+            ),
+        );
+    }
+
+    let expected_output = match loader.kind {
+        LoaderKind::Fabric => LoaderOutputExpectation::ExactJar {
+            path: "fabric-server-launch.jar".into(),
+            main_class: Some(
+                "net.fabricmc.loader.impl.launch.server.FabricServerLauncher".to_string(),
+            ),
+        },
+        LoaderKind::NeoForge => {
+            let base = format!("libraries/net/neoforged/neoforge/{}", loader.version);
+            LoaderOutputExpectation::ModernArgs {
+                windows: format!("{base}/win_args.txt").into(),
+                unix: format!("{base}/unix_args.txt").into(),
+            }
+        }
+        LoaderKind::Cleanroom => LoaderOutputExpectation::ExactJar {
+            path: format!("cleanroom-{minecraft_version}.jar").into(),
+            main_class: None,
+        },
+        LoaderKind::Forge if is_modern_minecraft(minecraft_version)? => {
+            let base = format!(
+                "libraries/net/minecraftforge/forge/{minecraft_version}-{}",
+                loader.version
+            );
+            LoaderOutputExpectation::ModernArgs {
+                windows: format!("{base}/win_args.txt").into(),
+                unix: format!("{base}/unix_args.txt").into(),
+            }
+        }
+        LoaderKind::Forge => LoaderOutputExpectation::ExactJar {
+            path: format!("forge-{minecraft_version}-{}.jar", loader.version).into(),
+            main_class: None,
+        },
+    };
+    if loader.output != expected_output {
+        return invalid(
+            "loader.output",
+            "does not match the exact output contract for the selected loader and versions",
+        );
+    }
+    Ok(())
+}
+
+fn validate_fabric_installer_url(value: &str) -> Result<String, ManifestValidationError> {
+    let url = validate_strict_https_url("loader.installer.url", value)?;
+    if !exact_https_origin(&url, "maven.fabricmc.net") {
+        return invalid(
+            "loader.installer.url",
+            "Fabric installers must use the exact https://maven.fabricmc.net origin",
+        );
+    }
+    let segments = url
+        .path_segments()
+        .map(Iterator::collect::<Vec<_>>)
+        .unwrap_or_default();
+    if segments.len() != 5
+        || segments[..3] != ["net", "fabricmc", "fabric-installer"]
+        || !validate_maven_segment_value(segments[3])
+        || segments[4] != format!("fabric-installer-{}.jar", segments[3])
+    {
+        return invalid(
+            "loader.installer.url",
+            "must match /net/fabricmc/fabric-installer/<version>/fabric-installer-<version>.jar",
+        );
+    }
+    Ok(value.to_string())
+}
+
+fn validate_maven_segment_value(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.contains("..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+'))
+}
+
+fn is_modern_minecraft(value: &str) -> Result<bool, ManifestValidationError> {
+    validate_minecraft_version("minecraft.version", value)?;
+    let mut components = value.split('.');
+    let major = components
+        .next()
+        .unwrap_or_default()
+        .parse::<u32>()
+        .map_err(|_| ManifestValidationError::InvalidField {
+            field: "minecraft.version".to_string(),
+            reason: "numeric component overflow".to_string(),
+        })?;
+    let minor = components
+        .next()
+        .unwrap_or_default()
+        .parse::<u32>()
+        .map_err(|_| ManifestValidationError::InvalidField {
+            field: "minecraft.version".to_string(),
+            reason: "numeric component overflow".to_string(),
+        })?;
+    Ok((major, minor) >= (1, 17))
 }
 
 fn origin(url: &Url) -> (String, String, Option<u16>) {
@@ -576,6 +951,7 @@ fn validate_path(
 ) -> Result<(), ManifestValidationError> {
     if value.is_empty()
         || value.trim() != value
+        || value.len() > MAX_PATH_BYTES
         || value.contains(['\\', '\0'])
         || value.starts_with('/')
         || has_windows_drive_prefix(value)
@@ -594,6 +970,14 @@ fn validate_path(
         return invalid(field, "must not contain empty or dot path components");
     }
     for component in value.split('/') {
+        if component.chars().any(|character| {
+            character.is_control() || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+        }) {
+            return invalid(
+                field,
+                "path components contain a Windows-forbidden character or ADS separator",
+            );
+        }
         if component.trim_end_matches([' ', '.']) != component {
             return invalid(field, "path components cannot end with a space or dot");
         }
@@ -644,11 +1028,16 @@ fn has_windows_drive_prefix(value: &str) -> bool {
 fn is_windows_device_name(component: &str) -> bool {
     let base = component.split('.').next().unwrap_or(component);
     let uppercase = base.to_ascii_uppercase();
-    matches!(uppercase.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || uppercase
-            .strip_prefix("COM")
-            .or_else(|| uppercase.strip_prefix("LPT"))
-            .is_some_and(|suffix| {
-                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-            })
+    matches!(
+        uppercase.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || uppercase
+        .strip_prefix("COM")
+        .or_else(|| uppercase.strip_prefix("LPT"))
+        .is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
 }

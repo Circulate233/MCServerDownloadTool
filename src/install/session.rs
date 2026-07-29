@@ -1,7 +1,9 @@
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::i18n::{Language, Localizer};
 
@@ -51,10 +53,35 @@ impl InstallSession {
         root.verify_target(&metadata_root)?;
         let log_path = metadata_root.join(INSTALL_LOG);
         root.verify_target(&log_path)?;
+        match fs::symlink_metadata(&log_path) {
+            Ok(metadata) => {
+                if is_link_or_reparse(&metadata)
+                    || has_multiple_links(&log_path, &metadata).map_err(|source| {
+                        InstallError::io("inspect installation log link count", &log_path, source)
+                    })?
+                    || !metadata.is_file()
+                {
+                    return Err(InstallError::UnsafePath {
+                        path: log_path,
+                        reason: "installation log must be a regular file with one link".to_string(),
+                    });
+                }
+                fs::remove_file(&log_path).map_err(|source| {
+                    InstallError::io("remove previous installation log", &log_path, source)
+                })?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(InstallError::io(
+                    "inspect installation log",
+                    &log_path,
+                    source,
+                ));
+            }
+        }
         let file = OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .write(true)
-            .truncate(true)
             .open(&log_path)
             .map_err(|source| {
                 InstallError::io("create persistent installation log", &log_path, source)
@@ -145,12 +172,12 @@ struct SessionObserver {
 
 impl SessionObserver {
     fn record_line(&self, category: &str, message: &str) -> Result<(), InstallObserverError> {
-        self.check()?;
+        self.check_failure()?;
         let mut logger = self
             .logger
             .lock()
             .map_err(|_| InstallObserverError::Synchronization)?;
-        if let Err(error) = logger.write_line(category, message) {
+        if let Err(error) = logger.write_line(category, message, true) {
             let failure = InstallObserverError::PersistentLog {
                 path: logger.path.clone(),
                 kind: error.kind(),
@@ -173,20 +200,8 @@ impl SessionObserver {
         }
         Ok(())
     }
-}
 
-impl InstallObserver for SessionObserver {
-    fn observe(&self, event: InstallEvent) -> Result<(), InstallObserverError> {
-        let message = Localizer::new(self.language).install_event(&event);
-        self.record_line("event", &message)?;
-        if let Err(error) = self.terminal.observe(event) {
-            self.store_failure(error.clone())?;
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    fn check(&self) -> Result<(), InstallObserverError> {
+    fn check_failure(&self) -> Result<(), InstallObserverError> {
         let failure = self
             .failure
             .lock()
@@ -195,10 +210,54 @@ impl InstallObserver for SessionObserver {
     }
 }
 
+impl InstallObserver for SessionObserver {
+    fn observe(&self, event: InstallEvent) -> Result<(), InstallObserverError> {
+        let message = Localizer::new(self.language).install_event(&event);
+        self.check_failure()?;
+        let mut logger = self
+            .logger
+            .lock()
+            .map_err(|_| InstallObserverError::Synchronization)?;
+        if let Err(error) = logger.write_event(&event, &message) {
+            let failure = InstallObserverError::PersistentLog {
+                path: logger.path.clone(),
+                kind: error.kind(),
+                reason: error.to_string(),
+            };
+            drop(logger);
+            self.store_failure(failure.clone())?;
+            return Err(failure);
+        }
+        drop(logger);
+        if let Err(error) = self.terminal.observe(event) {
+            self.store_failure(error.clone())?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn check(&self) -> Result<(), InstallObserverError> {
+        self.check_failure()?;
+        let mut logger = self
+            .logger
+            .lock()
+            .map_err(|_| InstallObserverError::Synchronization)?;
+        logger
+            .file
+            .flush()
+            .map_err(|error| InstallObserverError::PersistentLog {
+                path: logger.path.clone(),
+                kind: error.kind(),
+                reason: error.to_string(),
+            })
+    }
+}
+
 struct InstallLog {
-    file: File,
+    file: BufWriter<File>,
     path: PathBuf,
     secrets: Vec<String>,
+    progress: HashMap<String, (crate::net::TransferPhase, Instant)>,
 }
 
 impl InstallLog {
@@ -208,26 +267,127 @@ impl InstallLog {
         secrets: impl IntoIterator<Item = String>,
     ) -> Result<Self, InstallError> {
         let mut log = Self {
-            file,
+            file: BufWriter::with_capacity(64 * 1024, file),
             path,
             secrets: secrets
                 .into_iter()
                 .filter(|value| !value.is_empty())
                 .collect(),
+            progress: HashMap::new(),
         };
-        log.write_line("session", "installation session started")
+        log.write_line("session", "installation session started", true)
             .map_err(|source| {
                 InstallError::io("initialize persistent installation log", &log.path, source)
             })?;
         Ok(log)
     }
 
-    fn write_line(&mut self, category: &str, message: &str) -> io::Result<()> {
+    fn write_event(&mut self, event: &InstallEvent, message: &str) -> io::Result<()> {
+        let durable = matches!(event, InstallEvent::Stage(_));
+        if let InstallEvent::Transfer(transfer) = event {
+            let now = Instant::now();
+            let should_write = self
+                .progress
+                .get(&transfer.task_id)
+                .is_none_or(|(phase, last)| {
+                    *phase != transfer.phase
+                        || transfer.phase.terminal()
+                        || now.saturating_duration_since(*last) >= Duration::from_secs(1)
+                });
+            if !should_write {
+                return Ok(());
+            }
+            self.progress
+                .insert(transfer.task_id.clone(), (transfer.phase, now));
+        }
+        self.write_line("event", message, durable)
+    }
+
+    fn write_line(&mut self, category: &str, message: &str, durable: bool) -> io::Result<()> {
         let sanitized = sanitize(message, &self.secrets);
         writeln!(self.file, "[{category}] {sanitized}")?;
-        self.file.flush()?;
-        self.file.sync_data()
+        if durable {
+            self.file.flush()?;
+            self.file.get_ref().sync_data()?;
+        }
+        Ok(())
     }
+}
+
+impl Drop for InstallLog {
+    fn drop(&mut self) {
+        let _ = self.file.flush();
+        let _ = self.file.get_ref().sync_data();
+    }
+}
+
+#[cfg(windows)]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_type().is_symlink() || metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(unix)]
+fn has_multiple_links(_path: &Path, metadata: &fs::Metadata) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(metadata.nlink() > 1)
+}
+
+#[cfg(windows)]
+fn has_multiple_links(path: &Path, _metadata: &fs::Metadata) -> io::Result<bool> {
+    use std::time::Duration;
+
+    use crate::java::{EnvironmentPolicy, ProcessRequest, ProcessRunner, SystemProcessRunner};
+
+    let system_root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SystemRoot is not absolute"))?;
+    let fsutil = system_root.join("System32").join("fsutil.exe");
+    let metadata = fs::symlink_metadata(&fsutil)?;
+    if !metadata.is_file() || is_link_or_reparse(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "System32 fsutil.exe is not a trusted regular file",
+        ));
+    }
+    let output = SystemProcessRunner
+        .run(
+            &ProcessRequest::new(fsutil, Duration::from_secs(5))
+                .with_arguments([
+                    std::ffi::OsString::from("hardlink"),
+                    std::ffi::OsString::from("list"),
+                    path.as_os_str().to_os_string(),
+                ])
+                .with_environment(EnvironmentPolicy::Inherit)
+                .with_output_limit(256 * 1024),
+        )
+        .map_err(io::Error::other)?;
+    if output.exit_code != Some(0) {
+        return Err(io::Error::other(format!(
+            "fsutil hardlink list exited with {:?}",
+            output.exit_code
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(2)
+        .count()
+        > 1)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn has_multiple_links(_path: &Path, _metadata: &fs::Metadata) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "hard-link inspection is unavailable on this platform",
+    ))
 }
 
 fn sanitize(value: &str, secrets: &[String]) -> String {

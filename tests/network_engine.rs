@@ -820,6 +820,45 @@ fn size_and_hash_failures_preserve_existing_targets() {
 }
 
 #[test]
+fn unknown_size_maximum_rejects_declared_and_streamed_oversize_without_publication() {
+    for omit_length in [false, true] {
+        let server = TestServer::start(move |_| {
+            let response = TestResponse::ok(vec![9_u8; 33]);
+            if omit_length {
+                response.without_length()
+            } else {
+                response
+            }
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("installer.jar");
+        std::fs::write(&target, b"existing").unwrap();
+        let request = ArtifactRequest::builder(
+            if omit_length { "streamed" } else { "declared" },
+            &target,
+            server.url("/installer"),
+        )
+        .maximum_size(32)
+        .build()
+        .unwrap();
+
+        let error = test_engine()
+            .transfer_one(request, noop_observer())
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TransferError::SizeMismatch {
+                expected: 32,
+                actual: 33,
+                ..
+            }
+        ));
+        assert_eq!(std::fs::read(target).unwrap(), b"existing");
+    }
+}
+
+#[test]
 fn multiple_files_share_global_host_and_file_budgets_without_deadlock() {
     let bytes = Arc::new(vec![5_u8; 8192]);
     let response_bytes = Arc::clone(&bytes);

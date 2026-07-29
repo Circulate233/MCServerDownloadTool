@@ -19,6 +19,8 @@ pub struct InstallPlan {
     pub loader: LoaderPlan,
     /// Already-selected Java executable verified by the Java layer.
     pub java_executable: PathBuf,
+    /// Exact installer executable used for the Windows console ownership probe.
+    pub console_helper_executable: PathBuf,
     /// Heap, JVM arguments, and server arguments for the start script.
     pub java: crate::manifest::JavaConfig,
     /// Optional validated network proxy shared by HTTP and installer JVM requests.
@@ -41,6 +43,7 @@ impl InstallPlan {
     pub fn from_manifest(
         manifest: &ValidatedManifest,
         java_executable: PathBuf,
+        console_helper_executable: PathBuf,
         proxy: Option<crate::cli::ProxyUrl>,
         script_platform: ScriptPlatform,
         language: crate::i18n::Language,
@@ -80,6 +83,7 @@ impl InstallPlan {
                 output: loader.output.clone(),
             },
             java_executable,
+            console_helper_executable,
             java: manifest.java().clone(),
             proxy,
             script_platform,

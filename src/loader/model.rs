@@ -271,6 +271,12 @@ pub struct ProcessRequest {
     pub arguments: Vec<String>,
     /// Server root used as installer working directory.
     pub working_directory: PathBuf,
+    /// Maximum total installer runtime.
+    pub timeout: std::time::Duration,
+    /// Maximum bytes accepted before one newline.
+    pub max_line_bytes: usize,
+    /// Maximum bytes accepted from either output stream.
+    pub max_stream_bytes: usize,
 }
 
 /// Injectable process boundary for loader execution tests and production Java.
@@ -324,6 +330,20 @@ pub enum LoaderError {
     /// The installer returned a non-success status.
     #[error("loader installer exited unsuccessfully: {status}")]
     ProcessFailed { status: String },
+    /// The installer exceeded its total execution deadline.
+    #[error("loader installer exceeded {timeout:?} and its process tree was terminated{cleanup}", cleanup = cleanup_error.as_deref().map_or_else(String::new, |value| format!("; cleanup error: {value}")))]
+    ProcessTimedOut {
+        timeout: std::time::Duration,
+        cleanup_error: Option<String>,
+    },
+    /// One installer output stream or line exceeded its bounded logging contract.
+    #[error("loader installer {stream} exceeded the {kind} limit of {limit} bytes{cleanup}", cleanup = cleanup_error.as_deref().map_or_else(String::new, |value| format!("; cleanup error: {value}")))]
+    OutputLimit {
+        stream: &'static str,
+        kind: &'static str,
+        limit: usize,
+        cleanup_error: Option<String>,
+    },
     /// Output forwarding failed and the installer process was terminated.
     #[error("loader installer was terminated after output observation failed: {source}")]
     Observer {

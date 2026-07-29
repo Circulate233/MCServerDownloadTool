@@ -210,17 +210,65 @@ where
     }
 }
 
-fn resolve_manual_executable(
+pub(crate) fn resolve_manual_executable(
     input: &Path,
     platform: JavaPlatform,
     language: Language,
 ) -> Result<PathBuf, String> {
-    let executable = if input.is_dir() {
-        input.join("bin").join(platform.executable_name())
-    } else {
+    let absolute_input = if input.is_absolute() {
         input.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| match language {
+                Language::EnUs => format!("failed to resolve current directory: {source}"),
+                Language::ZhCn => format!("无法解析当前目录：{source}"),
+            })?
+            .join(input)
     };
-    if !executable.is_file() {
+    let input_metadata = fs::symlink_metadata(&absolute_input).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            return match language {
+                Language::EnUs => format!(
+                    "Java executable does not exist or is not a file: {}",
+                    absolute_input.display()
+                ),
+                Language::ZhCn => format!(
+                    "Java 可执行文件不存在或不是文件：{}",
+                    absolute_input.display()
+                ),
+            };
+        }
+        match language {
+            Language::EnUs => format!(
+                "failed to inspect Java path '{}': {source}",
+                absolute_input.display()
+            ),
+            Language::ZhCn => format!("无法检查 Java 路径“{}”：{source}", absolute_input.display()),
+        }
+    })?;
+    if is_link_or_reparse(&input_metadata) {
+        return Err(match language {
+            Language::EnUs => "Java path must not be a symlink or reparse point".to_string(),
+            Language::ZhCn => "Java 路径不得是符号链接或重解析点".to_string(),
+        });
+    }
+    let executable = if input_metadata.is_dir() {
+        absolute_input.join("bin").join(platform.executable_name())
+    } else {
+        absolute_input
+    };
+    reject_linked_components(&executable, language)?;
+    let metadata = fs::symlink_metadata(&executable).map_err(|source| match language {
+        Language::EnUs => format!(
+            "failed to inspect Java executable '{}': {source}",
+            executable.display()
+        ),
+        Language::ZhCn => format!(
+            "无法检查 Java 可执行文件“{}”：{source}",
+            executable.display()
+        ),
+    })?;
+    if !metadata.is_file() || is_link_or_reparse(&metadata) {
         return Err(match language {
             Language::EnUs => format!(
                 "Java executable does not exist or is not a file: {}",
@@ -239,6 +287,41 @@ fn resolve_manual_executable(
             executable.display()
         ),
     })
+}
+
+fn reject_linked_components(path: &Path, language: Language) -> Result<(), String> {
+    for ancestor in path.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor).map_err(|source| match language {
+            Language::EnUs => format!(
+                "failed to inspect Java path component '{}': {source}",
+                ancestor.display()
+            ),
+            Language::ZhCn => format!("无法检查 Java 路径组件“{}”：{source}", ancestor.display()),
+        })?;
+        if is_link_or_reparse(&metadata) {
+            return Err(match language {
+                Language::EnUs => format!(
+                    "Java path component '{}' is a symlink or reparse point",
+                    ancestor.display()
+                ),
+                Language::ZhCn => {
+                    format!("Java 路径组件“{}”是符号链接或重解析点", ancestor.display())
+                }
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_type().is_symlink() || metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn read_line<I: InteractiveIo>(io: &I, language: Language) -> Result<String, SelectionError> {

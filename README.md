@@ -28,7 +28,7 @@ Linux 使用 musl 目标。macOS 只提供 Apple Silicon 资产，且当前未�
 ./MCServerDownloadTool-linux-x86_64 --lang zh-CN
 ```
 
-4. 安装器会搜索本机 Java，并列出与 `java.major` 完全一致的候选。输入序号选择；没有候选时，输入 Java 可执行文件或 Java Home。
+4. 安装器先验证上次状态中记录的 Java；失效时才搜索本机 Java，并列出与 `java.major` 完全一致的候选。输入序号选择；没有候选时，输入 Java 可执行文件或 Java Home。
 5. 若生成 `missing-files.txt`，按其中的路径、项目页、大小和 SHA-1 补齐手动文件，再次运行安装器。
 6. 安装成功后使用同目录的 `start.bat` 或 `start.sh` 启动服务端。Minecraft EULA 由服务端首次启动流程处理。
 
@@ -74,6 +74,7 @@ mc-server-download-tool --manifest ./staging/server-install.json --lang zh-CN
 ```json
 {
   "schema_version": 1,
+  "curseforge_api_key": "REPLACE_WITH_DISTRIBUTION_KEY",
   "minecraft": {
     "version": "1.21.1"
   },
@@ -88,7 +89,7 @@ mc-server-download-tool --manifest ./staging/server-install.json --lang zh-CN
     "kind": "fabric",
     "version": "0.16.10",
     "installer": {
-      "url": "https://example.invalid/fabric-installer.jar",
+      "url": "https://maven.fabricmc.net/net/fabricmc/fabric-installer/1.1.1/fabric-installer-1.1.1.jar",
       "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "size": 1024
     },
@@ -105,9 +106,9 @@ mc-server-download-tool --manifest ./staging/server-install.json --lang zh-CN
       "path": "mods/example.jar",
       "download": {
         "mode": "automatic",
-        "url": "https://example.invalid/example.jar"
+        "url": "https://edge.forgecdn.net/files/1234/56/example.jar"
       },
-      "project_page": "https://example.invalid/project/files/1",
+      "project_page": "https://www.curseforge.com/minecraft/mc-mods/example/files/123456",
       "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "size": 2048
     }
@@ -115,7 +116,7 @@ mc-server-download-tool --manifest ./staging/server-install.json --lang zh-CN
 }
 ```
 
-示例域名和摘要只用于说明格式。
+示例摘要、文件 ID 和 API key 占位值只用于说明格式。
 
 ### 顶层字段
 
@@ -126,21 +127,22 @@ mc-server-download-tool --manifest ./staging/server-install.json --lang zh-CN
 | `java` | 是 | Java 主版本、堆内存、JVM 参数和服务端参数 |
 | `loader` | 是 | Loader 类型、精确版本、安装器和预期启动产物 |
 | `files` | 是 | 安装到服务端根目录下的文件数组，可为空 |
-| `curseforge_api_key` | 条件 | 仅当自动下载 URL 位于 `forgecdn.net` 或其子域时必需；其他情况下禁止出现 |
+| `curseforge_api_key` | 条件 | 使用精确 ForgeCDN 自动下载 URL 时必需；没有自动下载时禁止出现 |
 
 ### Java
 
 - `major` 必须为 `1..=255`，候选 Java 必须报告完全相同的主版本；Java 8 的 `1.8` 会识别为主版本 8。
 - `min_memory_mb` 必须大于零且不大于 `max_memory_mb`。
 - `jvm_args` 位于启动目标之前，`server_args` 位于启动目标之后；两者都是参数数组，不按 shell 字符串解析。
-- 安装器不会下载 Java。候选来自 PATH、Java 环境变量、常见 JDK/JRE 安装目录、厂商注册表项、SDKMAN、asdf、Gradle/IDE toolchain 和 Minecraft runtime 等平台来源。
+- 安装器不会下载 Java。PATH 空项和相对项被拒绝，候选不得经过 symlink、junction 或 reparse point。来源包括 PATH、Java 环境变量、系统安装目录、厂商注册表、SDKMAN、asdf、Gradle/IDE toolchain 和 Minecraft runtime；不会扫描服务端安装根下的 `runtime`。
 - Java 候选会规范化去重，并通过 `java -XshowSettings:properties -version` 并行验证版本、厂商和架构；用户始终按序号选择，或在无候选时手动指定并验证路径。
+- Probe 会清除 JVM 注入环境，并限制输出、候选数、目录扫描量和 worker 数。
 
 ### Loader
 
 `loader.kind` 支持 `forge`、`fabric`、`neoforge`、`cleanroom`。`version` 必须是非空的精确版本。
 
-`loader.installer` 必须提供无凭据的绝对 HTTPS JAR URL，并且在 `sha1` 与 `sha1_sidecar` 中恰好提供一个。sidecar 必须与安装器同源；`size` 可省略，出现时必须大于零。
+`loader.installer` 只能使用对应 Loader 的官方 origin 和精确 Maven 坐标；Cleanroom 另允许精确官方 GitHub Release URL。URL 禁止显式端口、userinfo、query 和 fragment。`sha1` 与精确追加 `.sha1` 的 sidecar 必须二选一；size 可省略，但下载始终受 512 MiB 上限。
 
 Loader 安装命令：
 
@@ -153,6 +155,7 @@ Loader 安装命令：
 - `exact_jar`：指定精确 JAR；Fabric 还必须指定并验证 JAR manifest 的 `Main-Class`。
 
 安装器不会按近似文件名猜测启动产物。
+Loader 进程清除 JVM 注入环境，限制单行 64 KiB、每流 16 MiB 和总运行时间 30 分钟；失败时回收完整进程树。JAR manifest 解压最多 1 MiB。
 
 ### 文件
 
@@ -189,7 +192,7 @@ Loader 安装命令：
 
 ### CurseForge API key
 
-当自动 URL 的 host 为 `forgecdn.net` 或其子域时，顶层必须提供 `curseforge_api_key`。该值只作为敏感 `x-api-key` header 发送到声明 URL 的同源请求；跨源重定向不会携带它，调试输出和错误消息也不会显示 key。
+自动 URL 只接受精确 `https://edge.forgecdn.net/files/<id>/<subId>/<filename>`，项目页只接受与文件类型匹配的精确 CurseForge category/slug/file ID 路径。自动下载要求顶层 `curseforge_api_key`；该值只发送到精确 ForgeCDN origin，跨源重定向、调试输出和错误消息不会携带它。
 
 Manifest 可能包含凭据，不应提交包含真实 key 的服务器清单。
 
@@ -203,17 +206,19 @@ Manifest 可能包含凭据，不应提交包含真实 key 的服务器清单。
   .mcsdt/
     install-state.json
     install.lock
+    install.log
     installers/
-    staging/
 ```
 
-`install-state.json` 记录 manifest SHA-256、Java 可执行文件、Loader 计划摘要、验证后的启动产物和生成脚本摘要，用于幂等复用。启动脚本只包含选定 Java 的绝对路径、内存、JVM 参数、精确 Loader 启动目标和服务端参数；它不会下载、校验、调用安装器或处理 EULA。
+`install-state.json` 记录 manifest SHA-256、Java 可执行文件、Loader 计划摘要、验证后的启动描述、每个 Loader 最终产物的 size/SHA-256 和生成脚本摘要。任一 Loader 产物损坏都会触发重装。启动脚本只包含选定 Java 的绝对路径、内存、JVM 参数、精确 Loader 启动目标和服务端参数；它不会下载、校验、调用安装器或处理 EULA。
 
-Windows 脚本仅在检测到独占控制台且启动失败时等待按键，终端调用仍保留正常退出码。Unix 脚本使用安全 quoting 和 `exec`，并设置可执行权限。
+Windows 脚本通过 System32 Windows PowerShell 的绝对路径检测控制台所有权，避免当前目录/PATH 劫持；仅在独占控制台且启动失败时等待按键。Unix 脚本使用安全 quoting 和 `exec`，并设置可执行权限。
 
 ## 下载引擎
 
-Loader 安装器和全部自动文件共用一个进程级下载引擎：HTTP/2、连接池、显式重定向策略、重试、Range 分段、SHA-1/大小校验、临时文件和原子发布均由同一实现处理。正确文件在发起请求前复用。
+Loader 安装器和全部自动文件共用一个进程级下载引擎。下载在经安装根验证的最终目标同目录创建临时文件并原子发布，安装层随后独立复验最终 size/hash，不再从第二份 staging 完整 copy。正确文件在发起请求前复用。
+
+Manifest 最大 8 MiB、最多 20,000 个文件；JVM/服务端参数数组各最多 512 项，单项最多 8 KiB。下载队列、目录扫描、Java 候选、外部命令输出和日志进度都具有硬上限。
 
 并发由 `available_parallelism()` 计算；无法获取系统并行度时明确失败：
 
@@ -229,7 +234,11 @@ per-file = min(per-host, clamp(cpu, 2, 16))
 
 每个正式 Release 包含三个固定名称的原始平台二进制、每个二进制对应的 `.sha256`、`release-index.json` 和 `provenance.sigstore.json`。`release-index.json` 记录版本、tag、commit、平台、目标、文件大小、SHA-256 和下载 URL。
 
-推送严格匹配 Cargo version 的 `v*` SemVer tag 会在 Actions 中创建非草稿 GitHub Release。详细流程见 [docs/releasing.md](docs/releasing.md)。
+推送合法的 `v*` SemVer tag 会以 tag 版本为权威，在 Actions 中创建非草稿 GitHub Release。详细流程见 [docs/releasing.md](docs/releasing.md)。
+
+### 与 MCModPackUtil 集成
+
+`MCModPackUtil` 只解析并下载 GitHub Releases 中最新的正式 `v*` tag；它不会使用本仓库分支、提交或未发布的 Actions artifact。因此任何安全修复、下载器修复或启动脚本修复都必须通过新的不可变发布 tag 正式发布后，才会进入后续构建的服务端包。不得移动既有 tag 或替换已发布资产；修复发布必须递增版本。
 
 ## 从源码构建
 

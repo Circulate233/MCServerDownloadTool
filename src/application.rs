@@ -161,10 +161,26 @@ where
                 session.root(),
                 self.script_platform,
             )?;
+            let state_path = session
+                .root()
+                .resolve(Path::new(".mcsdt/install-state.json"))?;
+            let preferred_java = crate::install::InstallState::load(&state_path)
+                .map_err(|source| {
+                    crate::install::InstallError::io(
+                        "read installation state before Java selection",
+                        &state_path,
+                        source,
+                    )
+                })?
+                .map(|state| PathBuf::from(state.java_executable));
             session.emit(InstallEvent::Stage(InstallStage::SelectingJava))?;
             let java_executable = self
                 .java
-                .provision(manifest.java(), session.root().path())
+                .provision(
+                    manifest.java(),
+                    session.root().path(),
+                    preferred_java.as_deref(),
+                )
                 .map_err(|error| AppError::Java {
                     reason: error.to_string(),
                 })?;
@@ -177,6 +193,7 @@ where
             let plan = InstallPlan::from_manifest(
                 &manifest,
                 java_executable,
+                executable.to_path_buf(),
                 options.proxy,
                 self.script_platform,
                 options.language,

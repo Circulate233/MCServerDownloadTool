@@ -419,6 +419,7 @@ pub struct ArtifactRequest {
     pub(crate) headers: HeaderMap,
     pub(crate) sensitive_headers: SensitiveHeaders,
     pub(crate) expected_size: Option<u64>,
+    pub(crate) maximum_size: Option<u64>,
     pub(crate) expected_sha1: Option<String>,
     pub(crate) expected_sha256: Option<String>,
 }
@@ -437,6 +438,7 @@ impl ArtifactRequest {
             headers: HeaderMap::new(),
             sensitive_headers: SensitiveHeaders::new(),
             expected_size: None,
+            maximum_size: None,
             expected_sha1: None,
             expected_sha256: None,
         }
@@ -463,6 +465,7 @@ pub struct ArtifactRequestBuilder {
     headers: HeaderMap,
     sensitive_headers: SensitiveHeaders,
     expected_size: Option<u64>,
+    maximum_size: Option<u64>,
     expected_sha1: Option<String>,
     expected_sha256: Option<String>,
 }
@@ -497,6 +500,13 @@ impl ArtifactRequestBuilder {
     #[must_use]
     pub fn expected_size(mut self, expected_size: u64) -> Self {
         self.expected_size = Some(expected_size);
+        self
+    }
+
+    /// Rejects a response whose completed size exceeds this many bytes.
+    #[must_use]
+    pub fn maximum_size(mut self, maximum_size: u64) -> Self {
+        self.maximum_size = Some(maximum_size);
         self
     }
 
@@ -538,6 +548,17 @@ impl ArtifactRequestBuilder {
             .collect::<Result<Vec<_>, _>>()?;
         let expected_sha1 = normalize_digest(self.expected_sha1, 40, "SHA-1")?;
         let expected_sha256 = normalize_digest(self.expected_sha256, 64, "SHA-256")?;
+        if self.maximum_size == Some(0)
+            || self
+                .expected_size
+                .zip(self.maximum_size)
+                .is_some_and(|(expected, maximum)| expected > maximum)
+        {
+            return Err(NetworkError::InvalidConfiguration {
+                reason: "artifact maximum_size must be positive and at least expected_size"
+                    .to_string(),
+            });
+        }
         Ok(ArtifactRequest {
             task_id: self.task_id,
             urls,
@@ -545,6 +566,7 @@ impl ArtifactRequestBuilder {
             headers: self.headers,
             sensitive_headers: self.sensitive_headers,
             expected_size: self.expected_size,
+            maximum_size: self.maximum_size,
             expected_sha1,
             expected_sha256,
         })

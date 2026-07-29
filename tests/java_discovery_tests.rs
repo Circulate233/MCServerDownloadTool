@@ -16,9 +16,14 @@ use mc_server_download_tool::java::{
 };
 
 fn inputs(platform: JavaPlatform) -> DiscoveryInputs {
+    let path_entry = if platform == JavaPlatform::Windows {
+        PathBuf::from("C:/path-java")
+    } else {
+        PathBuf::from("/path-java")
+    };
     DiscoveryInputs {
         platform,
-        path_entries: vec![PathBuf::from("/path-java")],
+        path_entries: vec![path_entry],
         java_home: Some(PathBuf::from("/env/jdk")),
         jre_home: Some(PathBuf::from("/env/jre")),
         user_home: Some(PathBuf::from("/users/alex")),
@@ -37,7 +42,7 @@ fn windows_candidate_plan_covers_environment_registry_vendors_and_minecraft() {
 
     assert!(
         plan.direct_executables
-            .contains(&PathBuf::from("/path-java/java.exe"))
+            .contains(&PathBuf::from("C:/path-java/java.exe"))
     );
     assert!(
         plan.direct_executables

@@ -10,6 +10,9 @@ use mc_server_download_tool::error::AppError;
 use mc_server_download_tool::i18n::{Localizer, resolve_language};
 
 fn main() {
+    if is_console_owner_probe() {
+        process::exit(console_owner_exit_code());
+    }
     let system_locale = sys_locale::get_locale();
     let cli = match try_parse_localized_from(std::env::args_os(), system_locale.as_deref()) {
         Ok(cli) => cli,
@@ -52,4 +55,40 @@ fn main() {
             process::exit(error.exit_code().as_i32());
         }
     }
+}
+
+fn is_console_owner_probe() -> bool {
+    let mut arguments = std::env::args_os();
+    let _executable = arguments.next();
+    arguments
+        .next()
+        .is_some_and(|argument| argument == "--mcsdt-console-owner")
+        && arguments.next().is_none()
+}
+
+#[cfg(windows)]
+fn console_owner_exit_code() -> i32 {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    let mut pid = Pid::from_u32(std::process::id());
+    for _ in 0..8 {
+        let Some(parent) = system.process(pid).and_then(sysinfo::Process::parent) else {
+            return 1;
+        };
+        let Some(process) = system.process(parent) else {
+            return 1;
+        };
+        if process.name().eq_ignore_ascii_case("explorer.exe") {
+            return 0;
+        }
+        pid = parent;
+    }
+    1
+}
+
+#[cfg(not(windows))]
+const fn console_owner_exit_code() -> i32 {
+    1
 }

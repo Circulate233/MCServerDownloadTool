@@ -391,6 +391,16 @@ impl NetworkEngine {
                 Ok(DownloadMode::Single)
             }
             ProbeOutcome::Range(range) => {
+                if request
+                    .maximum_size
+                    .is_some_and(|maximum| range.total > maximum)
+                {
+                    return Err(TransferError::SizeMismatch {
+                        task_id: request.task_id.clone(),
+                        expected: request.maximum_size.unwrap_or_default(),
+                        actual: range.total,
+                    });
+                }
                 progress.set_total(Some(range.total));
                 if range.total < self.limits.segment_threshold
                     || (range.validator.is_none() && request.expected_sha256.is_none())
@@ -1235,6 +1245,15 @@ fn stream_full_response(
             actual,
         });
     }
+    if let (Some(maximum), Some(actual)) = (request.maximum_size, header_length)
+        && actual > maximum
+    {
+        return Err(TransferError::SizeMismatch {
+            task_id: request.task_id.clone(),
+            expected: maximum,
+            actual,
+        });
+    }
     progress.set_total(request.expected_size.or(header_length));
     let mut file = create_new_file(request, staging, "create streaming temporary file")?;
     let result = stream_unbounded(
@@ -1244,6 +1263,7 @@ fn stream_full_response(
         &mut file,
         progress,
         request.expected_size,
+        request.maximum_size,
     );
     if let Err(error) = result {
         drop(file);
@@ -1264,6 +1284,7 @@ fn stream_unbounded(
     source: &mut dyn Read,
     target: &mut File,
     progress: &Arc<TaskProgress>,
+    expected: Option<u64>,
     maximum: Option<u64>,
 ) -> Result<u64, TransferError> {
     let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
@@ -1277,10 +1298,11 @@ fn stream_unbounded(
             break;
         }
         written = written.saturating_add(count as u64);
-        if maximum.is_some_and(|maximum| written > maximum) {
+        let bound = expected.or(maximum);
+        if bound.is_some_and(|maximum| written > maximum) {
             return Err(TransferError::SizeMismatch {
                 task_id: request.task_id.clone(),
-                expected: maximum.expect("checked Some"),
+                expected: bound.expect("checked Some"),
                 actual: written,
             });
         }
@@ -1294,7 +1316,7 @@ fn stream_unbounded(
             })?;
         progress.add_bytes(count as u64, TransferPhase::Single);
     }
-    if let Some(expected) = maximum
+    if let Some(expected) = expected
         && written != expected
     {
         return Err(TransferError::SizeMismatch {

@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use reqwest::header::{HeaderName, HeaderValue};
 use sha1::{Digest, Sha1};
@@ -22,11 +23,13 @@ use super::atomic;
 use super::model::{
     InstallError, InstallEvent, InstallObserver, InstallPlan, InstallResult, InstallStage,
 };
-use super::state::InstallState;
-use super::{InstallRoot, InstallSession};
+use super::state::{InstallState, InstalledArtifact};
+use super::{DownloadTarget, InstallRoot, InstallSession};
 
 const MISSING_FILES: &str = "missing-files.txt";
 const MAX_SHA1_SIDECAR_RESPONSE: usize = 1024;
+const MAX_LOADER_INSTALLER_BYTES: u64 = 512 * 1024 * 1024;
+static DOWNLOAD_TARGET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Installation state-machine boundary used by the CLI integration layer.
 pub trait InstallCore {
@@ -152,6 +155,7 @@ where
             installer_sha1.as_deref(),
             &observer,
         )?;
+        let loader_artifacts = loader_artifact_digests(&paths.security, &plan.loader.output)?;
         session.check_log()?;
 
         emit(&observer, InstallEvent::Stage(InstallStage::WritingState))?;
@@ -161,6 +165,7 @@ where
             previous_state.as_ref(),
             &identity,
             &launch,
+            &loader_artifacts,
             &observer,
         )?;
         session.emit(InstallEvent::Stage(InstallStage::Completed))?;
@@ -175,13 +180,11 @@ where
 struct InstallPaths {
     security: InstallRoot,
     state: PathBuf,
-    staging: PathBuf,
     installer: PathBuf,
 }
 
 impl InstallPaths {
     fn create(security: InstallRoot, plan: &InstallPlan) -> Result<Self, InstallError> {
-        let staging = security.create_directory(Path::new(".mcsdt/staging"))?;
         let installers = security.create_directory(Path::new(".mcsdt/installers"))?;
         let state = security.resolve(Path::new(".mcsdt/install-state.json"))?;
         let installer = installers.join(&plan.loader.installer.file_name);
@@ -189,7 +192,6 @@ impl InstallPaths {
         Ok(Self {
             security,
             state,
-            staging,
             installer,
         })
     }
@@ -211,15 +213,19 @@ fn download_required<E: ArtifactTransfer + HttpTransport>(
     let mut pending = Vec::new();
     for (index, install_file) in plan.files.iter().enumerate() {
         let target = paths.security.resolve(Path::new(&install_file.path))?;
+        create_target_parent(&paths.security, &target)?;
         if verify_manifest_file(&target, install_file).is_ok() {
             emit(observer, InstallEvent::Reused { target })?;
         } else if let FileDownload::Automatic { url } = &install_file.download {
+            let download_target = paths.security.download_target(
+                &target,
+                DOWNLOAD_TARGET_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            )?;
             let curseforge_api_key =
                 scoped_curseforge_key(install_file, plan.curseforge_api_key.as_ref());
             pending.push(PendingArtifact::manifest(
                 index,
-                &paths.staging,
-                target,
+                download_target,
                 url,
                 install_file,
                 curseforge_api_key,
@@ -239,9 +245,12 @@ fn download_required<E: ArtifactTransfer + HttpTransport>(
         )
         .is_err()
     {
+        let download_target = paths.security.download_target(
+            &paths.installer,
+            DOWNLOAD_TARGET_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        )?;
         pending.push(PendingArtifact::installer(
-            &paths.staging,
-            paths.installer.clone(),
+            download_target,
             &plan.loader.installer,
             installer_sha1.as_deref().unwrap_or_default(),
         )?);
@@ -253,13 +262,12 @@ fn download_required<E: ArtifactTransfer + HttpTransport>(
             },
         )?;
     }
-    transfer_and_publish(engine, &paths.security, &pending, observer)?;
+    transfer_and_publish(engine, &pending, observer)?;
     Ok(installer_sha1)
 }
 
 fn transfer_and_publish<E: ArtifactTransfer>(
     engine: &E,
-    security: &InstallRoot,
     pending: &[PendingArtifact],
     observer: &Arc<dyn InstallObserver>,
 ) -> Result<(), InstallError> {
@@ -283,32 +291,26 @@ fn transfer_and_publish<E: ArtifactTransfer>(
     }
     for artifact in pending {
         observer.check()?;
-        security.verify_existing_file(&artifact.staging)?;
-        artifact.verify()?;
-    }
-    for artifact in pending {
-        observer.check()?;
-        security.verify_existing_file(&artifact.staging)?;
-        security.verify_target(&artifact.target)?;
-        atomic::copy(&artifact.staging, &artifact.target).map_err(|source| {
-            InstallError::io(
-                "atomically publish verified artifact",
-                &artifact.target,
-                source,
-            )
-        })?;
-        security.verify_existing_file(&artifact.target)?;
-        if let Err(error) = fs::remove_file(&artifact.staging) {
-            emit(
-                observer,
-                InstallEvent::CleanupWarning {
-                    path: artifact.staging.clone(),
-                    reason: error.to_string(),
-                },
-            )?;
-        }
+        artifact.verify_staging()?;
+        artifact.publish()?;
     }
     Ok(())
+}
+
+fn create_target_parent(root: &InstallRoot, target: &Path) -> Result<(), InstallError> {
+    let relative = target
+        .strip_prefix(root.path())
+        .map_err(|_| InstallError::UnsafePath {
+            path: target.to_path_buf(),
+            reason: "artifact target is outside the installation root".to_string(),
+        })?;
+    if let Some(parent) = relative
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        root.create_directory(parent)?;
+    }
+    root.verify_target(target)
 }
 
 fn run_loader<L: LoaderInstallation>(
@@ -358,6 +360,7 @@ fn write_script_and_state(
     previous_state: Option<&InstallState>,
     identity: &InstallIdentity,
     launch: &crate::loader::VerifiedLaunch,
+    loader_artifacts: &[InstalledArtifact],
     observer: &Arc<dyn InstallObserver>,
 ) -> Result<(), InstallError> {
     observer.check()?;
@@ -367,6 +370,7 @@ fn write_script_and_state(
         &ScriptRequest {
             platform: plan.script_platform,
             java_executable: &plan.java_executable,
+            console_helper_executable: &plan.console_helper_executable,
             java: &plan.java,
             launch,
             windows_failure: WindowsFailureBehavior::PauseOwnedConsole,
@@ -393,6 +397,7 @@ fn write_script_and_state(
         java_executable: identity.java_executable.clone(),
         loader_plan_sha256: identity.loader_plan_sha256.clone(),
         loader_output: launch.clone(),
+        loader_artifacts: loader_artifacts.to_vec(),
         script_sha256,
     };
     paths.security.verify_target(&paths.state)?;
@@ -491,7 +496,62 @@ fn reusable_loader(
             && validate_loader_output_paths(root, expected, true).is_ok()
             && verify_loader_output(root.path(), expected)
                 .is_ok_and(|launch| launch == state.loader_output)
+            && loader_artifact_digests(root, expected)
+                .is_ok_and(|artifacts| artifacts == state.loader_artifacts)
     })
+}
+
+fn loader_artifact_digests(
+    root: &InstallRoot,
+    expected: &crate::loader::LoaderOutputExpectation,
+) -> Result<Vec<InstalledArtifact>, InstallError> {
+    let relative_paths = match expected {
+        crate::loader::LoaderOutputExpectation::ModernArgs { windows, unix } => {
+            vec![windows.as_path(), unix.as_path()]
+        }
+        crate::loader::LoaderOutputExpectation::ExactJar { path, .. } => vec![path.as_path()],
+    };
+    let mut artifacts = Vec::with_capacity(relative_paths.len());
+    for relative in relative_paths {
+        let full = root.resolve(relative)?;
+        root.verify_existing_file(&full)?;
+        let mut file = File::open(&full)
+            .map_err(|source| InstallError::io("open loader output for hashing", &full, source))?;
+        let metadata = file.metadata().map_err(|source| {
+            InstallError::io("inspect loader output for hashing", &full, source)
+        })?;
+        let mut hasher = Sha256::new();
+        let size = std::io::copy(&mut file, &mut DigestWriter(&mut hasher))
+            .map_err(|source| InstallError::io("hash loader output", &full, source))?;
+        if size != metadata.len() {
+            return Err(InstallError::Verification {
+                target: full,
+                reason: format!(
+                    "file size changed while hashing: {} -> {size}",
+                    metadata.len()
+                ),
+            });
+        }
+        artifacts.push(InstalledArtifact {
+            path: relative.to_path_buf(),
+            size,
+            sha256: format!("{:x}", hasher.finalize()),
+        });
+    }
+    Ok(artifacts)
+}
+
+struct DigestWriter<'a>(&'a mut Sha256);
+
+impl std::io::Write for DigestWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn enforce_manual_files(
@@ -558,8 +618,7 @@ fn scoped_curseforge_key<'a>(
 #[derive(Debug)]
 struct PendingArtifact {
     request: ArtifactRequest,
-    staging: PathBuf,
-    target: PathBuf,
+    target: DownloadTarget,
     expected_size: Option<u64>,
     hash: ExpectedHash,
 }
@@ -572,15 +631,13 @@ enum ExpectedHash {
 impl PendingArtifact {
     fn manifest(
         index: usize,
-        staging_root: &Path,
-        target: PathBuf,
+        target: DownloadTarget,
         url: &str,
         file: &ManifestFile,
         curseforge_api_key: Option<&crate::manifest::SecretString>,
     ) -> Result<Self, InstallError> {
-        let staging = staging_root.join(format!("file-{index}.download"));
         let task_id = format!("manifest-file-{index}");
-        let mut builder = ArtifactRequest::builder(&task_id, &staging, url);
+        let mut builder = ArtifactRequest::builder(&task_id, target.staging_path(), url);
         builder = builder.expected_size(file.size).expected_sha1(&file.sha1);
         if let Some(key) = curseforge_api_key {
             let sensitive = SensitiveHeaders::new().allow_origin(url)?.insert(
@@ -595,7 +652,6 @@ impl PendingArtifact {
         }
         Ok(Self {
             request: builder.build()?,
-            staging,
             target,
             expected_size: Some(file.size),
             hash: ExpectedHash::Sha1(file.sha1.clone()),
@@ -603,32 +659,50 @@ impl PendingArtifact {
     }
 
     fn installer(
-        staging_root: &Path,
-        target: PathBuf,
+        target: DownloadTarget,
         installer: &crate::loader::InstallerArtifact,
         sha1: &str,
     ) -> Result<Self, InstallError> {
-        let staging = staging_root.join("loader-installer.download");
-        let mut builder = ArtifactRequest::builder("loader-installer", &staging, &installer.url)
-            .expected_sha1(sha1);
+        let mut builder =
+            ArtifactRequest::builder("loader-installer", target.staging_path(), &installer.url)
+                .expected_sha1(sha1)
+                .maximum_size(MAX_LOADER_INSTALLER_BYTES);
         if let Some(size) = installer.size {
             builder = builder.expected_size(size);
         }
         Ok(Self {
             request: builder.build()?,
-            staging,
             target,
             expected_size: installer.size,
             hash: ExpectedHash::Sha1(sha1.to_string()),
         })
     }
 
-    fn verify(&self) -> Result<(), InstallError> {
-        verify_path(&self.staging, self.expected_size, &self.hash).map_err(|reason| {
-            InstallError::Verification {
-                target: self.target.clone(),
-                reason,
-            }
+    fn verify_staging(&self) -> Result<(), InstallError> {
+        verify_reader(
+            self.target.open_staging().map_err(|source| {
+                InstallError::io(
+                    "open anchored staged artifact",
+                    self.target.final_path(),
+                    source,
+                )
+            })?,
+            self.expected_size,
+            &self.hash,
+        )
+        .map_err(|reason| InstallError::Verification {
+            target: self.target.final_path().to_path_buf(),
+            reason,
+        })
+    }
+
+    fn publish(&self) -> Result<(), InstallError> {
+        self.target.publish().map_err(|source| {
+            InstallError::io(
+                "atomically publish anchored verified artifact",
+                self.target.final_path(),
+                source,
+            )
         })
     }
 }
@@ -651,25 +725,34 @@ fn verify_path(path: &Path, expected_size: Option<u64>, hash: &ExpectedHash) -> 
     if !metadata.is_file() {
         return Err("target is not a regular file".to_string());
     }
-    if expected_size.is_some_and(|expected| expected != metadata.len()) {
-        return Err(format!(
-            "size is {}, expected {}",
-            metadata.len(),
-            expected_size.unwrap_or_default()
-        ));
-    }
+    verify_reader(&mut file, expected_size, hash)
+}
+
+fn verify_reader(
+    mut file: impl Read,
+    expected_size: Option<u64>,
+    hash: &ExpectedHash,
+) -> Result<(), String> {
     let (actual, expected) = match hash {
         ExpectedHash::Sha1(expected) => (stream_digest::<Sha1>(&mut file)?, expected),
     };
-    if !actual.eq_ignore_ascii_case(expected) {
-        return Err(format!("digest is {actual}, expected {expected}"));
+    if expected_size.is_some_and(|expected| expected != actual.1) {
+        return Err(format!(
+            "size is {}, expected {}",
+            actual.1,
+            expected_size.unwrap_or_default()
+        ));
+    }
+    if !actual.0.eq_ignore_ascii_case(expected) {
+        return Err(format!("digest is {}, expected {expected}", actual.0));
     }
     Ok(())
 }
 
-fn stream_digest<D: Digest + Default>(reader: &mut impl Read) -> Result<String, String> {
+fn stream_digest<D: Digest + Default>(reader: &mut impl Read) -> Result<(String, u64), String> {
     let mut digest = D::default();
     let mut buffer = vec![0_u8; 256 * 1024].into_boxed_slice();
+    let mut size = 0_u64;
     loop {
         let read = reader
             .read(&mut buffer)
@@ -677,6 +760,7 @@ fn stream_digest<D: Digest + Default>(reader: &mut impl Read) -> Result<String, 
         if read == 0 {
             break;
         }
+        size = size.saturating_add(read as u64);
         digest.update(&buffer[..read]);
     }
     let output = digest.finalize();
@@ -685,7 +769,7 @@ fn stream_digest<D: Digest + Default>(reader: &mut impl Read) -> Result<String, 
         use std::fmt::Write as _;
         write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
     }
-    Ok(encoded)
+    Ok((encoded, size))
 }
 
 fn resolve_installer_sha1<E: HttpTransport>(

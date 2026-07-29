@@ -2,10 +2,15 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
+
+use command_group::{CommandGroup, GroupChild};
+
+const DEFAULT_OUTPUT_LIMIT: usize = 1024 * 1024;
 
 /// Environment handling applied before a child process starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +32,8 @@ pub struct ProcessRequest {
     pub timeout: Duration,
     /// Environment policy for the child.
     pub environment: EnvironmentPolicy,
+    /// Maximum bytes retained from each output stream.
+    pub max_output_bytes: usize,
 }
 
 impl ProcessRequest {
@@ -38,6 +45,7 @@ impl ProcessRequest {
             arguments: Vec::new(),
             timeout,
             environment: EnvironmentPolicy::Inherit,
+            max_output_bytes: DEFAULT_OUTPUT_LIMIT,
         }
     }
 
@@ -59,6 +67,13 @@ impl ProcessRequest {
     #[must_use]
     pub const fn with_environment(mut self, environment: EnvironmentPolicy) -> Self {
         self.environment = environment;
+        self
+    }
+
+    /// Sets the hard byte limit independently applied to stdout and stderr.
+    #[must_use]
+    pub const fn with_output_limit(mut self, max_output_bytes: usize) -> Self {
+        self.max_output_bytes = max_output_bytes;
         self
     }
 }
@@ -132,6 +147,19 @@ pub enum ProcessError {
         program: PathBuf,
         /// Pipe name.
         stream: &'static str,
+    },
+    /// A child emitted more data than the configured per-stream bound.
+    #[error(
+        "{stream} from process '{}' exceeded the {limit}-byte capture limit",
+        program.display()
+    )]
+    OutputLimit {
+        /// Requested executable.
+        program: PathBuf,
+        /// Pipe that exceeded the limit.
+        stream: &'static str,
+        /// Configured maximum bytes.
+        limit: usize,
     },
     /// A configured child pipe was unexpectedly unavailable after spawning.
     #[error(
@@ -211,11 +239,13 @@ impl ProcessRunner for SystemProcessRunner {
             }
         }
 
-        let mut child = command.spawn().map_err(|source| ProcessError::Spawn {
-            program: request.program.clone(),
-            source,
-        })?;
-        let Some(stdout) = child.stdout.take() else {
+        let mut child = command
+            .group_spawn()
+            .map_err(|source| ProcessError::Spawn {
+                program: request.program.clone(),
+                source,
+            })?;
+        let Some(stdout) = child.inner().stdout.take() else {
             let cleanup_error = terminate_and_reap(&mut child);
             return Err(ProcessError::MissingPipe {
                 program: request.program.clone(),
@@ -223,7 +253,7 @@ impl ProcessRunner for SystemProcessRunner {
                 cleanup_error,
             });
         };
-        let Some(stderr) = child.stderr.take() else {
+        let Some(stderr) = child.inner().stderr.take() else {
             let cleanup_error = terminate_and_reap(&mut child);
             return Err(ProcessError::MissingPipe {
                 program: request.program.clone(),
@@ -232,7 +262,15 @@ impl ProcessRunner for SystemProcessRunner {
             });
         };
 
-        let stdout_reader = spawn_reader(stdout, "stdout", &request.program).map_err(|error| {
+        let (limit_sender, limit_receiver) = mpsc::channel();
+        let stdout_reader = spawn_reader(
+            stdout,
+            "stdout",
+            &request.program,
+            request.max_output_bytes,
+            limit_sender.clone(),
+        )
+        .map_err(|error| {
             let cleanup_error = terminate_and_reap(&mut child);
             match error {
                 ProcessError::ReaderSpawn { source, .. } => ProcessError::ReaderSpawn {
@@ -246,7 +284,13 @@ impl ProcessRunner for SystemProcessRunner {
                 other => other,
             }
         })?;
-        let stderr_reader = match spawn_reader(stderr, "stderr", &request.program) {
+        let stderr_reader = match spawn_reader(
+            stderr,
+            "stderr",
+            &request.program,
+            request.max_output_bytes,
+            limit_sender,
+        ) {
             Ok(reader) => reader,
             Err(error) => {
                 let cleanup_error = terminate_and_reap(&mut child);
@@ -266,6 +310,25 @@ impl ProcessRunner for SystemProcessRunner {
         };
 
         let status = loop {
+            if let Ok(stream) = limit_receiver.try_recv() {
+                let cleanup_error = terminate_and_reap(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                if let Some(cleanup) = cleanup_error {
+                    return Err(ProcessError::Read {
+                        program: request.program.clone(),
+                        stream,
+                        source: io::Error::other(format!(
+                            "output limit exceeded; cleanup error: {cleanup}"
+                        )),
+                    });
+                }
+                return Err(ProcessError::OutputLimit {
+                    program: request.program.clone(),
+                    stream,
+                    limit: request.max_output_bytes,
+                });
+            }
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => {}
@@ -310,6 +373,8 @@ fn spawn_reader<R>(
     mut stream: R,
     name: &'static str,
     program: &std::path::Path,
+    limit: usize,
+    limit_sender: mpsc::Sender<&'static str>,
 ) -> Result<thread::JoinHandle<io::Result<Vec<u8>>>, ProcessError>
 where
     R: Read + Send + 'static,
@@ -317,8 +382,19 @@ where
     thread::Builder::new()
         .name(format!("java-{name}-reader"))
         .spawn(move || {
-            let mut bytes = Vec::new();
-            stream.read_to_end(&mut bytes)?;
+            let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+            let mut buffer = [0_u8; 16 * 1024];
+            loop {
+                let read = stream.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                if bytes.len().saturating_add(read) > limit {
+                    let _ = limit_sender.send(name);
+                    return Err(io::Error::other("child output exceeded capture limit"));
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+            }
             Ok(bytes)
         })
         .map_err(|source| ProcessError::ReaderSpawn {
@@ -346,7 +422,7 @@ fn join_reader(
         })
 }
 
-fn terminate_and_reap(child: &mut std::process::Child) -> Option<String> {
+fn terminate_and_reap(child: &mut GroupChild) -> Option<String> {
     let kill_error = child.kill().err().map(|error| error.to_string());
     let wait_error = child.wait().err().map(|error| error.to_string());
     match (kill_error, wait_error) {
