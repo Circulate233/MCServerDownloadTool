@@ -84,8 +84,13 @@ fn console_owner_exit_code() -> i32 {
 
 #[cfg(windows)]
 fn pause_if_explorer_console() {
-    use std::io::IsTerminal as _;
-    if !io::stdin().is_terminal() || !launched_from_explorer() {
+    // A console executable started from Explorer owns the transient console
+    // window. Keep it open for every terminal outcome so users can read a
+    // successful completion, a recoverable error, or a panic report.
+    // `read_line` returns immediately when Explorer supplied an EOF/redirected
+    // standard input, so this does not turn non-interactive invocations into a
+    // deadlock.
+    if !launched_from_explorer() {
         return;
     }
     PAUSE_AFTER_RUN.call_once(|| {

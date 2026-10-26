@@ -294,19 +294,16 @@ fn manual_missing_list_is_written_before_loader_execution() {
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured_events = Arc::clone(&events);
 
-    let error = installer
+    let result = installer
         .install(
             &manifest_path,
             &plan,
             Arc::new(move |event| captured_events.lock().unwrap().push(event)),
         )
-        .unwrap_err();
+        .unwrap();
 
-    assert!(matches!(
-        error,
-        InstallError::ManualFilesMissing { count: 1, .. }
-    ));
-    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert!(!result.loader_reused);
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
     assert!(events.lock().unwrap().iter().any(|event| matches!(
         event,
         InstallEvent::ManualDownloadRequired {
@@ -319,6 +316,11 @@ fn manual_missing_list_is_written_before_loader_execution() {
             && Localizer::new(Language::ZhCn)
                 .install_event(event)
                 .contains("https://example.invalid/project")
+    )));
+    assert!(events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        InstallEvent::ManualFilesPending { count: 1, list_path }
+            if list_path.ends_with("missing-files.txt")
     )));
     assert_eq!(
         fs::read_to_string(temp.path().join("missing-files.txt")).unwrap(),
@@ -486,20 +488,17 @@ fn unavailable_curseforge_file_is_reported_manually_and_cancelled_downloads_are_
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured_events = Arc::clone(&events);
 
-    let error = installer
+    let result = installer
         .install(
             &manifest_path,
             &plan,
             Arc::new(move |event| captured_events.lock().unwrap().push(event)),
         )
-        .unwrap_err();
+        .unwrap();
 
-    assert!(matches!(
-        error,
-        InstallError::ManualFilesMissing { count: 1, .. }
-    ));
+    assert!(!result.loader_reused);
     assert_eq!(transfers.load(Ordering::SeqCst), 2);
-    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
     assert_eq!(
         fs::read(temp.path().join("mods/available.jar")).unwrap(),
         b"automatic"
@@ -526,4 +525,11 @@ fn unavailable_curseforge_file_is_reported_manually_and_cancelled_downloads_are_
                     .install_event(event)
                     .contains("https://example.invalid/project")
     )));
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, InstallEvent::ManualFilesPending { count: 1, .. }))
+    );
 }

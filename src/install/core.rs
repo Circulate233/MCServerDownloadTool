@@ -648,10 +648,14 @@ fn enforce_manual_files(
             },
         )?;
     }
-    Err(InstallError::ManualFilesMissing {
-        count: missing.len(),
-        list_path,
-    })
+    emit(
+        observer,
+        InstallEvent::ManualFilesPending {
+            count: missing.len(),
+            list_path,
+        },
+    )?;
+    Ok(())
 }
 
 fn scoped_curseforge_key<'a>(

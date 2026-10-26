@@ -143,6 +143,13 @@ pub enum InstallEvent {
         /// `CurseForge` page for the exact file release.
         project_page: String,
     },
+    /// Manual files remain missing; installation continues and the report is retained.
+    ManualFilesPending {
+        /// Number of files that still need to be downloaded.
+        count: usize,
+        /// Durable report containing paths, links, and hashes.
+        list_path: PathBuf,
+    },
     /// A committed operation succeeded but best-effort cleanup failed.
     CleanupWarning {
         /// Path that could not be removed.
@@ -269,7 +276,8 @@ pub enum InstallError {
     /// The loader SHA-1 sidecar did not contain exactly one valid digest.
     #[error("loader SHA-1 sidecar '{url}' is invalid: {reason}")]
     InvalidInstallerSha1 { url: String, reason: String },
-    /// Manual files are missing or invalid; the list was written before returning.
+    /// Legacy error retained for API compatibility; current installs report
+    /// missing manual files and continue through the Loader instead.
     #[error("{count} manual file(s) are missing or invalid; see '{list_path}'")]
     ManualFilesMissing { count: usize, list_path: PathBuf },
     /// Loader execution or strict output verification failed.

@@ -698,6 +698,16 @@ impl Localizer {
                     path.display(),
                 ),
             },
+            InstallEvent::ManualFilesPending { count, list_path } => match self.language {
+                Language::EnUs => format!(
+                    "{count} manual file(s) are still missing; installation will continue. See '{}' and add them before starting the server",
+                    list_path.display()
+                ),
+                Language::ZhCn => format!(
+                    "仍有 {count} 个手动文件缺失，安装将继续；请查看“{}”，补齐后再启动服务端",
+                    list_path.display()
+                ),
+            },
             InstallEvent::CleanupWarning { path, reason } => match self.language {
                 Language::EnUs => {
                     format!(

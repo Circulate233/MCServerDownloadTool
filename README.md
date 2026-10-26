@@ -186,7 +186,7 @@ Loader 进程清除 JVM 注入环境，限制单行 64 KiB、每流 16 MiB 和�
 }
 ```
 
-安装器先下载所有自动资源，再统一验证手动资源。缺失或校验失败的手动文件会写入根目录 `missing-files.txt` 并终止本次安装；补齐后再次运行即可继续。
+安装器先下载所有自动资源，再统一验证手动资源。缺失或校验失败的手动文件会写入根目录 `missing-files.txt`，同时输出 CurseForge 文件页和目标路径；安装器仍会继续执行 Loader、生成启动脚本和安装状态。补齐后再次运行即可完成校验，清理过期清单。
 
 路径拒绝绝对路径、盘符、反斜杠、`.`/`..`、空组件、Windows 设备名、大小写不敏感的重复目标，以及 `.mcsdt`、启动脚本、安装器和 manifest 等保留路径。
 
@@ -212,7 +212,7 @@ Manifest 可能包含凭据，不应提交包含真实 key 的服务器清单。
 
 `install-state.json` 记录 manifest SHA-256、Java 可执行文件、Loader 计划摘要、验证后的启动描述、每个 Loader 最终产物的 size/SHA-256 和生成脚本摘要。任一 Loader 产物损坏都会触发重装。启动脚本只包含选定 Java 的绝对路径、内存、JVM 参数、精确 Loader 启动目标和服务端参数；它不会下载、校验、调用安装器或处理 EULA。
 
-Windows 脚本通过 System32 Windows PowerShell 的绝对路径检测控制台所有权，避免当前目录/PATH 劫持；仅在独占控制台且启动失败时等待按键。Unix 脚本使用安全 quoting 和 `exec`，并设置可执行权限。
+Windows 脚本通过安装器辅助进程检测 Explorer 创建的临时控制台，避免窗口在成功或失败后立即关闭；Unix 脚本使用安全 quoting 和 `exec`，并设置可执行权限。
 
 ## 下载引擎
 

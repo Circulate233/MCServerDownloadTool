@@ -19,12 +19,12 @@ pub enum ScriptPlatform {
     Unix,
 }
 
-/// Explicit Windows console behavior after the Java process fails.
+/// Explicit Windows console behavior after the Java process exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowsFailureBehavior {
     /// Return Java's exit status without waiting for input.
     Return,
-    /// Pause only when the batch file owns the interactive invocation.
+    /// Pause after success or failure when the batch file owns the interactive invocation.
     PauseOwnedConsole,
 }
 
@@ -202,9 +202,10 @@ popd\r\n"
         ":mcsdt_after_launch\r\nif defined MCSDT_CODEPAGE chcp %MCSDT_CODEPAGE% >nul\r\n",
     );
     if request.windows_failure == WindowsFailureBehavior::PauseOwnedConsole {
-        script.push_str(
-            "if not \"%MCSDT_EXIT%\"==\"0\" if \"%MCSDT_OWNED_CONSOLE%\"==\"1\" pause\r\n",
-        );
+        // The batch file may have created the console itself. Keep that
+        // transient window open for both success and failure so users can read
+        // the final server status and any diagnostics.
+        script.push_str("if \"%MCSDT_OWNED_CONSOLE%\"==\"1\" pause\r\n");
     }
     script.push_str("exit /b %MCSDT_EXIT%\r\n");
     Ok(script)

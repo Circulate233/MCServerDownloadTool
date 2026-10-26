@@ -201,6 +201,31 @@ fn main() {
 
 #[cfg(windows)]
 fn assert_owned_windows_console_pauses(server_root: &Path, capture: &Path, explorer_parent: &Path) {
+    let mut owned_success = Command::new(explorer_parent)
+        .current_dir(server_root)
+        .env("MCSDT_FAKE_CAPTURE", capture)
+        .env("MCSDT_FAKE_EXIT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(400));
+    assert!(
+        owned_success.try_wait().unwrap().is_none(),
+        "an Explorer-owned successful invocation must wait for a key"
+    );
+    owned_success.stdin.take().unwrap().write_all(b"x").unwrap();
+    assert_eq!(
+        wait_without_hanging(
+            owned_success,
+            INVOCATION_TIMEOUT,
+            "successful Explorer-owned invocation"
+        )
+        .code(),
+        Some(0)
+    );
+
     let mut owned = Command::new(explorer_parent)
         .current_dir(server_root)
         .env("MCSDT_FAKE_CAPTURE", capture)

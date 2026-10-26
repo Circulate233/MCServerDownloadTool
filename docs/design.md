@@ -66,7 +66,7 @@ Loader 返回成功后仍必须验证 manifest 声明的精确输出。Forge/Neo
 
 自动 URL 必须匹配精确 ForgeCDN origin/path，`project_page` 必须匹配文件类型对应的 CurseForge category/slug/file ID。Manifest 最大 8 MiB、最多 20,000 个文件；参数数组各最多 512 项，单项最多 8 KiB。
 
-自动文件与 Loader installer 进入同一批下载。随后一次性检查全部 manual 文件；失败项写入原子更新的 `missing-files.txt` 后终止，不会运行 Loader。全部补齐时删除过期清单。
+自动文件与 Loader installer 进入同一批下载。随后一次性检查全部 manual 文件；失败项写入原子更新的 `missing-files.txt` 并提示直达的 CurseForge 文件页，但安装仍继续运行 Loader、生成启动脚本和安装状态。全部补齐时删除过期清单。
 
 ### CurseForge key
 
@@ -113,7 +113,7 @@ Windows 生成 `start.bat`，Unix 生成可执行 `start.sh`。两者只包含�
 - 验证后的 args file 或精确 `-jar` 目标；
 - manifest 服务端参数。
 
-脚本不下载、不校验、不调用安装器、不写 EULA。Windows 使用 System32 Windows PowerShell 绝对路径检测 Explorer 控制台，避免当前目录/PATH 劫持；Unix 使用单引号安全转义和 `exec`。
+脚本不下载、不校验、不调用安装器、不写 EULA。Windows 使用安装器辅助进程识别 Explorer 创建的临时控制台，并在成功或失败后暂停，避免窗口关闭导致用户看不到结果；Unix 使用单引号安全转义和 `exec`。
 
 ## 错误与日志
 
