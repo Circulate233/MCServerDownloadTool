@@ -9,10 +9,20 @@ use mc_server_download_tool::cli::try_parse_localized_from;
 use mc_server_download_tool::error::AppError;
 use mc_server_download_tool::i18n::{Localizer, resolve_language};
 
+#[cfg(windows)]
+static PAUSE_AFTER_RUN: std::sync::Once = std::sync::Once::new();
+
 fn main() {
     if is_console_owner_probe() {
         process::exit(console_owner_exit_code());
     }
+    install_panic_pause_hook();
+    let exit_code = run_installer();
+    pause_if_explorer_console();
+    process::exit(exit_code);
+}
+
+fn run_installer() -> i32 {
     let system_locale = sys_locale::get_locale();
     let cli = match try_parse_localized_from(std::env::args_os(), system_locale.as_deref()) {
         Ok(cli) => cli,
@@ -24,9 +34,9 @@ fn main() {
             };
             if let Err(error) = write_result {
                 eprintln!("failed to write command output: {error}");
-                process::exit(70);
+                return 70;
             }
-            process::exit(failure.exit_code());
+            return failure.exit_code();
         }
     };
 
@@ -37,7 +47,7 @@ fn main() {
         Err(error) => {
             let error = AppError::CurrentExecutable(error);
             eprintln!("{}", localizer.fatal_error(&error));
-            process::exit(error.exit_code().as_i32());
+            return error.exit_code().as_i32();
         }
     };
 
@@ -52,9 +62,10 @@ fn main() {
         ),
         Err(error) => {
             eprintln!("{}", localizer.fatal_error(&error));
-            process::exit(error.exit_code().as_i32());
+            return error.exit_code().as_i32();
         }
     }
+    0
 }
 
 fn is_console_owner_probe() -> bool {
@@ -68,6 +79,34 @@ fn is_console_owner_probe() -> bool {
 
 #[cfg(windows)]
 fn console_owner_exit_code() -> i32 {
+    i32::from(!launched_from_explorer())
+}
+
+#[cfg(windows)]
+fn pause_if_explorer_console() {
+    use std::io::IsTerminal as _;
+    if !io::stdin().is_terminal() || !launched_from_explorer() {
+        return;
+    }
+    PAUSE_AFTER_RUN.call_once(|| {
+        print!("按 Enter 键关闭此窗口 / Press Enter to close this window...");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+    });
+}
+
+#[cfg(windows)]
+fn install_panic_pause_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        default_hook(panic);
+        pause_if_explorer_console();
+    }));
+}
+
+#[cfg(windows)]
+fn launched_from_explorer() -> bool {
     use sysinfo::{Pid, ProcessesToUpdate, System};
 
     let mut system = System::new();
@@ -75,20 +114,26 @@ fn console_owner_exit_code() -> i32 {
     let mut pid = Pid::from_u32(std::process::id());
     for _ in 0..8 {
         let Some(parent) = system.process(pid).and_then(sysinfo::Process::parent) else {
-            return 1;
+            return false;
         };
         let Some(process) = system.process(parent) else {
-            return 1;
+            return false;
         };
         if process.name().eq_ignore_ascii_case("explorer.exe") {
-            return 0;
+            return true;
         }
         pid = parent;
     }
-    1
+    false
 }
 
 #[cfg(not(windows))]
 const fn console_owner_exit_code() -> i32 {
     1
 }
+
+#[cfg(not(windows))]
+const fn pause_if_explorer_console() {}
+
+#[cfg(not(windows))]
+const fn install_panic_pause_hook() {}

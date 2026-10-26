@@ -265,10 +265,7 @@ impl SensitiveHeaders {
     }
 
     pub(crate) fn for_url(&self, url: &Url) -> HeaderMap {
-        if Origin::from_url(url)
-            .ok()
-            .is_some_and(|origin| self.allowed_origins.contains(&origin))
-        {
+        if Origin::from_url(url).is_ok_and(|origin| self.allowed_origins.contains(&origin)) {
             self.headers.clone()
         } else {
             HeaderMap::new()

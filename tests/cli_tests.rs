@@ -136,7 +136,7 @@ fn process_exit_codes_distinguish_help_usage_and_manifest_io() {
         .output()
         .unwrap();
     assert_eq!(usage.status.code(), Some(2));
-    assert!(!usage.stderr.is_empty());
+    assert_ne!(usage.stderr, [] as [u8; 0]);
 
     let missing = Command::new(executable)
         .args([

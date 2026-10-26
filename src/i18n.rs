@@ -684,6 +684,20 @@ impl Localizer {
                 Language::EnUs => "verified loader output; installer execution skipped".to_string(),
                 Language::ZhCn => "Loader 输出验证通过，已跳过安装器执行".to_string(),
             },
+            InstallEvent::ManualDownloadRequired {
+                name,
+                path,
+                project_page,
+            } => match self.language {
+                Language::EnUs => format!(
+                    "CurseForge file '{name}' cannot be downloaded automatically. Open {project_page} to download it, then save it to '{}'",
+                    path.display(),
+                ),
+                Language::ZhCn => format!(
+                    "CurseForge 文件“{name}”无法自动下载，请打开此链接下载：{project_page}，然后保存到“{}”",
+                    path.display(),
+                ),
+            },
             InstallEvent::CleanupWarning { path, reason } => match self.language {
                 Language::EnUs => {
                     format!(
@@ -709,13 +723,13 @@ impl Localizer {
             match self.language {
                 Language::EnUs => write!(
                     report,
-                    "\n- {}\n  Path: {}\n  Project: {}\n  Required: {} bytes, SHA-1 {}\n",
+                    "\n- {}\n  Path: {}\n  CurseForge file page: {}\n  Required: {} bytes, SHA-1 {}\n",
                     file.name, file.path, file.project_page, file.size, file.sha1
                 )
                 .expect("writing to String cannot fail"),
                 Language::ZhCn => write!(
                     report,
-                    "\n- {}\n  路径：{}\n  项目页：{}\n  要求：{} 字节，SHA-1 {}\n",
+                    "\n- {}\n  路径：{}\n  CurseForge 文件页：{}\n  要求：{} 字节，SHA-1 {}\n",
                     file.name, file.path, file.project_page, file.size, file.sha1
                 )
                 .expect("writing to String cannot fail"),

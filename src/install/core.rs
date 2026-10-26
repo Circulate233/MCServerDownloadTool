@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,7 @@ use crate::loader::{
 use crate::manifest::{FileDownload, ManifestFile};
 use crate::net::{
     ArtifactRequest, ArtifactTransfer, HttpRequest, HttpTransport, NetworkError, SensitiveHeaders,
-    TransferEvent, TransferObserver, TransferObserverError,
+    TransferError, TransferEvent, TransferObserver, TransferObserverError,
 };
 use crate::scripts::{ScriptOutcome, ScriptRequest, WindowsFailureBehavior, write_start_script};
 
@@ -133,7 +134,7 @@ where
             &plan.loader.output,
         );
 
-        let installer_sha1 =
+        let (installer_sha1, unavailable_files) =
             download_required(&self.engine, &paths, plan, reusable_loader, &observer)?;
         session.check_log()?;
 
@@ -141,7 +142,13 @@ where
             &observer,
             InstallEvent::Stage(InstallStage::CheckingManualFiles),
         )?;
-        enforce_manual_files(&paths.security, &plan.files, plan.language)?;
+        enforce_manual_files(
+            &paths.security,
+            &plan.files,
+            &unavailable_files,
+            &observer,
+            plan.language,
+        )?;
 
         emit(
             &observer,
@@ -209,7 +216,7 @@ fn download_required<E: ArtifactTransfer + HttpTransport>(
     plan: &InstallPlan,
     reusable_loader: bool,
     observer: &Arc<dyn InstallObserver>,
-) -> Result<Option<String>, InstallError> {
+) -> Result<(Option<String>, Vec<usize>), InstallError> {
     let mut pending = Vec::new();
     for (index, install_file) in plan.files.iter().enumerate() {
         let target = paths.security.resolve(Path::new(&install_file.path))?;
@@ -262,39 +269,64 @@ fn download_required<E: ArtifactTransfer + HttpTransport>(
             },
         )?;
     }
-    transfer_and_publish(engine, &pending, observer)?;
-    Ok(installer_sha1)
+    let unavailable_files = transfer_and_publish(engine, &pending, observer)?;
+    Ok((installer_sha1, unavailable_files))
 }
 
 fn transfer_and_publish<E: ArtifactTransfer>(
     engine: &E,
     pending: &[PendingArtifact],
     observer: &Arc<dyn InstallObserver>,
-) -> Result<(), InstallError> {
+) -> Result<Vec<usize>, InstallError> {
     if pending.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     emit(observer, InstallEvent::Stage(InstallStage::Downloading))?;
     let transfer_observer: Arc<dyn TransferObserver> = Arc::new(TransferBridge {
         observer: Arc::clone(observer),
     });
-    let requests = pending.iter().map(|item| item.request.clone()).collect();
-    let results = engine.transfer_many(requests, transfer_observer);
-    observer.check()?;
-    let failures = results
-        .into_iter()
-        .filter_map(Result::err)
-        .map(|error| error.to_string())
-        .collect::<Vec<_>>();
+    let mut round = pending.to_vec();
+    let mut unavailable_files = Vec::new();
+    let mut failures = Vec::new();
+    while !round.is_empty() {
+        let requests = round.iter().map(|item| item.request.clone()).collect();
+        let results = engine.transfer_many(requests, Arc::clone(&transfer_observer));
+        observer.check()?;
+        let round_size = round.len();
+        let mut retry = Vec::new();
+        for (artifact, result) in round.into_iter().zip(results) {
+            match result {
+                Ok(_) => {
+                    observer.check()?;
+                    artifact.verify_staging()?;
+                    artifact.publish()?;
+                }
+                Err(error) if is_curseforge_unavailable(&error) => {
+                    if let Some(index) = artifact.manual_file_index {
+                        unavailable_files.push(index);
+                    } else {
+                        failures.push(error.to_string());
+                    }
+                }
+                Err(TransferError::Cancelled { .. }) => retry.push(artifact),
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        if !retry.is_empty() && retry.len() == round_size {
+            failures.extend(retry.into_iter().map(|artifact| {
+                format!(
+                    "artifact task '{}' was cancelled without a reported cause",
+                    artifact.request.task_id()
+                )
+            }));
+            break;
+        }
+        round = retry;
+    }
     if !failures.is_empty() {
         return Err(InstallError::Transfer { failures });
     }
-    for artifact in pending {
-        observer.check()?;
-        artifact.verify_staging()?;
-        artifact.publish()?;
-    }
-    Ok(())
+    Ok(unavailable_files)
 }
 
 fn create_target_parent(root: &InstallRoot, target: &Path) -> Result<(), InstallError> {
@@ -557,11 +589,18 @@ impl std::io::Write for DigestWriter<'_> {
 fn enforce_manual_files(
     root: &InstallRoot,
     files: &[ManifestFile],
+    unavailable_files: &[usize],
+    observer: &Arc<dyn InstallObserver>,
     language: crate::i18n::Language,
 ) -> Result<(), InstallError> {
+    let unavailable_files = unavailable_files.iter().copied().collect::<HashSet<_>>();
     let missing = files
         .iter()
-        .filter(|entry| matches!(entry.download, FileDownload::Manual))
+        .enumerate()
+        .filter(|(index, entry)| {
+            matches!(entry.download, FileDownload::Manual) || unavailable_files.contains(index)
+        })
+        .map(|(_, entry)| entry)
         .filter(|entry| {
             root.resolve(Path::new(&entry.path))
                 .and_then(|path| {
@@ -599,6 +638,16 @@ fn enforce_manual_files(
         InstallError::io("atomically write missing-file list", &list_path, source)
     })?;
     root.verify_existing_file(&list_path)?;
+    for file in &missing {
+        emit(
+            observer,
+            InstallEvent::ManualDownloadRequired {
+                name: file.name.clone(),
+                path: root.resolve(Path::new(&file.path))?,
+                project_page: file.project_page.clone(),
+            },
+        )?;
+    }
     Err(InstallError::ManualFilesMissing {
         count: missing.len(),
         list_path,
@@ -615,15 +664,16 @@ fn scoped_curseforge_key<'a>(
         .flatten()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PendingArtifact {
     request: ArtifactRequest,
     target: DownloadTarget,
     expected_size: Option<u64>,
     hash: ExpectedHash,
+    manual_file_index: Option<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ExpectedHash {
     Sha1(String),
 }
@@ -638,9 +688,17 @@ impl PendingArtifact {
     ) -> Result<Self, InstallError> {
         let task_id = format!("manifest-file-{index}");
         let mut builder = ArtifactRequest::builder(&task_id, target.staging_path(), url);
+        let mirror_url = forgecdn_mirror_url(url);
+        if let Some(mirror_url) = &mirror_url {
+            builder = builder.candidate_url(mirror_url);
+        }
         builder = builder.expected_size(file.size).expected_sha1(&file.sha1);
         if let Some(key) = curseforge_api_key {
-            let sensitive = SensitiveHeaders::new().allow_origin(url)?.insert(
+            let mut sensitive = SensitiveHeaders::new().allow_origin(url)?;
+            if let Some(mirror_url) = &mirror_url {
+                sensitive = sensitive.allow_origin(mirror_url)?;
+            }
+            let sensitive = sensitive.insert(
                 HeaderName::from_static("x-api-key"),
                 HeaderValue::from_str(key.expose()).map_err(|_| {
                     NetworkError::InvalidConfiguration {
@@ -655,6 +713,7 @@ impl PendingArtifact {
             target,
             expected_size: Some(file.size),
             hash: ExpectedHash::Sha1(file.sha1.clone()),
+            manual_file_index: Some(index),
         })
     }
 
@@ -675,6 +734,7 @@ impl PendingArtifact {
             target,
             expected_size: installer.size,
             hash: ExpectedHash::Sha1(sha1.to_string()),
+            manual_file_index: None,
         })
     }
 
@@ -704,6 +764,37 @@ impl PendingArtifact {
                 source,
             )
         })
+    }
+}
+
+fn forgecdn_mirror_url(url: &str) -> Option<String> {
+    let mut parsed = reqwest::Url::parse(url).ok()?;
+    if !parsed
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("edge.forgecdn.net"))
+    {
+        return None;
+    }
+    parsed.set_host(Some("mediafilez.forgecdn.net")).ok()?;
+    Some(parsed.to_string())
+}
+
+fn is_curseforge_unavailable(error: &crate::net::TransferError) -> bool {
+    const UNAVAILABLE_STATUSES: [u16; 2] = [403, 404];
+    match error {
+        crate::net::TransferError::Network {
+            source: NetworkError::HttpStatus { status, .. },
+            ..
+        } => UNAVAILABLE_STATUSES.contains(status),
+        crate::net::TransferError::CandidatesExhausted { failures, .. } => {
+            !failures.is_empty()
+                && failures.iter().all(|failure| {
+                    UNAVAILABLE_STATUSES
+                        .iter()
+                        .any(|status| failure.contains(&format!("returned status {status}")))
+                })
+        }
+        _ => false,
     }
 }
 
@@ -886,5 +977,48 @@ mod tests {
             scoped_curseforge_key(&file("https://downloads.example.com/mod.jar"), Some(&key),)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn forgecdn_fallback_uses_only_the_known_curseforge_mirror() {
+        assert_eq!(
+            forgecdn_mirror_url("https://edge.forgecdn.net/files/1234/56/mod.jar"),
+            Some("https://mediafilez.forgecdn.net/files/1234/56/mod.jar".to_string())
+        );
+        assert_eq!(
+            forgecdn_mirror_url("https://example.com/files/1234/56/mod.jar"),
+            None
+        );
+    }
+
+    #[test]
+    fn only_explicit_curseforge_forbidden_or_missing_statuses_are_manual() {
+        for status in [403, 404] {
+            assert!(is_curseforge_unavailable(
+                &crate::net::TransferError::Network {
+                    task_id: "mod".to_string(),
+                    source: NetworkError::HttpStatus {
+                        url: "https://edge.forgecdn.net/files/1/2/mod.jar".to_string(),
+                        status,
+                        attempts: 1,
+                    },
+                }
+            ));
+        }
+        assert!(!is_curseforge_unavailable(
+            &crate::net::TransferError::Network {
+                task_id: "mod".to_string(),
+                source: NetworkError::HttpStatus {
+                    url: "https://edge.forgecdn.net/files/1/2/mod.jar".to_string(),
+                    status: 500,
+                    attempts: 1,
+                },
+            }
+        ));
+        assert!(!is_curseforge_unavailable(
+            &crate::net::TransferError::Cancelled {
+                task_id: "mod".to_string(),
+            }
+        ));
     }
 }

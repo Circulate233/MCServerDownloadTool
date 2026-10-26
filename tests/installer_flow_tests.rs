@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use mc_server_download_tool::i18n::{Language, Localizer};
 use mc_server_download_tool::install::{
     InstallCore, InstallError, InstallEvent, InstallObserver, InstallObserverError, InstallPlan,
     InstallSession, Installer,
@@ -22,6 +23,11 @@ use url::Url;
 
 #[derive(Clone)]
 struct FakeEngine {
+    transfers: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct UnavailableCurseForgeFileEngine {
     transfers: Arc<AtomicUsize>,
 }
 
@@ -53,6 +59,62 @@ impl ArtifactTransfer for FakeEngine {
                 Ok(ArtifactOutcome {
                     task_id: request.task_id().to_string(),
                     source_url: Url::parse("https://example.invalid/artifact").unwrap(),
+                    target: request.target().to_path_buf(),
+                    bytes: bytes.len() as u64,
+                    mode: DownloadMode::Single,
+                })
+            })
+            .collect()
+    }
+}
+
+impl HttpTransport for UnavailableCurseForgeFileEngine {
+    fn get_bytes(&self, _request: HttpRequest) -> Result<HttpResponse, NetworkError> {
+        Err(NetworkError::InvalidConfiguration {
+            reason: "metadata access was not expected".to_string(),
+        })
+    }
+}
+
+impl ArtifactTransfer for UnavailableCurseForgeFileEngine {
+    fn transfer_many(
+        &self,
+        requests: Vec<ArtifactRequest>,
+        _observer: Arc<dyn TransferObserver>,
+    ) -> Vec<Result<ArtifactOutcome, TransferError>> {
+        let round = self.transfers.fetch_add(1, Ordering::SeqCst);
+        requests
+            .into_iter()
+            .enumerate()
+            .map(|(index, request)| {
+                if round == 0 {
+                    return if index == 0 {
+                        Err(TransferError::Network {
+                            task_id: request.task_id().to_string(),
+                            source: NetworkError::HttpStatus {
+                                url: "https://edge.forgecdn.net/files/1234/56/restricted.jar"
+                                    .to_string(),
+                                status: 404,
+                                attempts: 1,
+                            },
+                        })
+                    } else {
+                        Err(TransferError::Cancelled {
+                            task_id: request.task_id().to_string(),
+                        })
+                    };
+                }
+                let bytes = if request.task_id() == "loader-installer" {
+                    b"installer".as_slice()
+                } else {
+                    b"automatic".as_slice()
+                };
+                fs::create_dir_all(request.target().parent().unwrap()).unwrap();
+                fs::write(request.target(), bytes).unwrap();
+                Ok(ArtifactOutcome {
+                    task_id: request.task_id().to_string(),
+                    source_url: Url::parse("https://edge.forgecdn.net/files/1234/56/file.jar")
+                        .unwrap(),
                     target: request.target().to_path_buf(),
                     bytes: bytes.len() as u64,
                     mode: DownloadMode::Single,
@@ -229,9 +291,15 @@ fn manual_missing_list_is_written_before_loader_execution() {
         transfers: Arc::new(AtomicUsize::new(0)),
     };
     let installer = Installer::new(engine, loader);
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_events = Arc::clone(&events);
 
     let error = installer
-        .install(&manifest_path, &plan, Arc::new(|_| {}))
+        .install(
+            &manifest_path,
+            &plan,
+            Arc::new(move |event| captured_events.lock().unwrap().push(event)),
+        )
         .unwrap_err();
 
     assert!(matches!(
@@ -239,13 +307,26 @@ fn manual_missing_list_is_written_before_loader_execution() {
         InstallError::ManualFilesMissing { count: 1, .. }
     ));
     assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert!(events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        InstallEvent::ManualDownloadRequired {
+            name,
+            path,
+            project_page,
+        } if name == "Test file"
+            && path.ends_with("mods/manual.jar")
+            && project_page == "https://example.invalid/project"
+            && Localizer::new(Language::ZhCn)
+                .install_event(event)
+                .contains("https://example.invalid/project")
+    )));
     assert_eq!(
         fs::read_to_string(temp.path().join("missing-files.txt")).unwrap(),
         concat!(
             "Manual files require attention:\n",
             "\n- Test file\n",
             "  Path: mods/manual.jar\n",
-            "  Project: https://example.invalid/project\n",
+            "  CurseForge file page: https://example.invalid/project\n",
             "  Required: 6 bytes, SHA-1 b363713a938afcd3c74603827fab79e935b2b09b\n"
         )
     );
@@ -376,4 +457,73 @@ fn loader_output_observer_failure_stops_before_scripts_and_state() {
         .unwrap(),
         b"installer"
     );
+}
+
+#[test]
+fn unavailable_curseforge_file_is_reported_manually_and_cancelled_downloads_are_retried() {
+    let temp = tempfile::tempdir().unwrap();
+    let manifest_path = temp.path().join("server-install.json");
+    fs::write(&manifest_path, b"stable manifest bytes").unwrap();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let transfers = Arc::new(AtomicUsize::new(0));
+    let mut restricted = manifest_file("mods/restricted.jar", true, b"automatic");
+    restricted.download = FileDownload::Automatic {
+        url: "https://edge.forgecdn.net/files/1234/56/restricted.jar".to_string(),
+    };
+    let (plan, loader) = plan(
+        vec![
+            restricted,
+            manifest_file("mods/available.jar", true, b"automatic"),
+        ],
+        Arc::clone(&runs),
+    );
+    let installer = Installer::new(
+        UnavailableCurseForgeFileEngine {
+            transfers: Arc::clone(&transfers),
+        },
+        loader,
+    );
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_events = Arc::clone(&events);
+
+    let error = installer
+        .install(
+            &manifest_path,
+            &plan,
+            Arc::new(move |event| captured_events.lock().unwrap().push(event)),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        InstallError::ManualFilesMissing { count: 1, .. }
+    ));
+    assert_eq!(transfers.load(Ordering::SeqCst), 2);
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fs::read(temp.path().join("mods/available.jar")).unwrap(),
+        b"automatic"
+    );
+    assert!(
+        temp.path()
+            .join(".mcsdt/installers/cleanroom-installer.jar")
+            .is_file()
+    );
+    let report = fs::read_to_string(temp.path().join("missing-files.txt")).unwrap();
+    assert!(report.contains("mods/restricted.jar"));
+    assert!(report.contains("https://example.invalid/project"));
+    assert!(events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        InstallEvent::ManualDownloadRequired {
+            name,
+            path,
+            project_page,
+        }
+            if name == "Test file"
+                && path.ends_with("mods/restricted.jar")
+                && project_page == "https://example.invalid/project"
+                && Localizer::new(Language::ZhCn)
+                    .install_event(event)
+                    .contains("https://example.invalid/project")
+    )));
 }

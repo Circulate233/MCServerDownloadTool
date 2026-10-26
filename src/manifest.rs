@@ -446,9 +446,7 @@ impl FileDownload {
         let Self::Automatic { url } = self else {
             return false;
         };
-        Url::parse(url)
-            .ok()
-            .is_some_and(|url| exact_https_origin(&url, FORGE_CDN_ORIGIN))
+        Url::parse(url).is_ok_and(|url| exact_https_origin(&url, FORGE_CDN_ORIGIN))
     }
 }
 

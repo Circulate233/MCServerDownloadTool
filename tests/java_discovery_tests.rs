@@ -131,7 +131,10 @@ fn materialized_candidates_are_canonical_and_deduplicated() {
 
     let report = discover_from_plan(&plan, JavaPlatform::current());
 
-    assert!(report.warnings.is_empty());
+    assert_eq!(
+        report.warnings,
+        Vec::<mc_server_download_tool::java::DiscoveryWarning>::new()
+    );
     assert_eq!(
         report.candidates,
         vec![std::fs::canonicalize(executable).unwrap()]
@@ -189,7 +192,7 @@ fn materialized_candidates_do_not_traverse_linked_directories() {
 
     let report = discover_from_plan(&plan, JavaPlatform::Linux);
 
-    assert!(report.candidates.is_empty());
+    assert_eq!(report.candidates, Vec::<PathBuf>::new());
 }
 
 #[test]

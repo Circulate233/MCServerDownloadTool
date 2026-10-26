@@ -104,7 +104,7 @@ pub enum InstallStage {
     SelectingJava,
     /// Existing files and state are being validated.
     Inspecting,
-    /// Loader installer and automatic files are transferred as one batch.
+    /// Loader installer and automatic files are transferred through retryable batches.
     Downloading,
     /// Manual files are checked together after automatic downloads.
     CheckingManualFiles,
@@ -134,6 +134,15 @@ pub enum InstallEvent {
     },
     /// Existing loader output allowed installer execution to be skipped.
     LoaderReused,
+    /// A `CurseForge` file was denied or no longer exists and needs manual download.
+    ManualDownloadRequired {
+        /// Human-readable project name.
+        name: String,
+        /// Expected destination beneath the server root.
+        path: PathBuf,
+        /// `CurseForge` page for the exact file release.
+        project_page: String,
+    },
     /// A committed operation succeeded but best-effort cleanup failed.
     CleanupWarning {
         /// Path that could not be removed.
