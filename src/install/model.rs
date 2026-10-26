@@ -106,6 +106,8 @@ pub enum InstallStage {
     Inspecting,
     /// Loader installer and automatic files are transferred through retryable batches.
     Downloading,
+    /// Loader libraries declared by the installer are fetched through the shared engine.
+    DownloadingLoaderLibraries,
     /// Manual files are checked together after automatic downloads.
     CheckingManualFiles,
     /// Loader installation or idempotent output verification is running.
@@ -134,6 +136,10 @@ pub enum InstallEvent {
     },
     /// Existing loader output allowed installer execution to be skipped.
     LoaderReused,
+    /// Installer dependencies were downloaded or verified before launching the installer.
+    LoaderLibrariesPrepared { count: usize },
+    /// Some dependencies were left for the installer to fetch after pre-download.
+    LoaderLibraryPreseedWarning { detail: String },
     /// A `CurseForge` file was denied or no longer exists and needs manual download.
     ManualDownloadRequired {
         /// Human-readable project name.

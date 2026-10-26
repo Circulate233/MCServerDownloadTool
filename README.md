@@ -172,17 +172,21 @@ Loader 进程清除 JVM 注入环境，限制单行 64 KiB、每流 16 MiB 和�
 自动下载：
 
 ```json
-"download": {
-  "mode": "automatic",
-  "url": "https://edge.forgecdn.net/files/1234/56/example.jar"
+{
+  "download": {
+    "mode": "automatic",
+    "url": "https://edge.forgecdn.net/files/1234/56/example.jar"
+  }
 }
 ```
 
 手动下载：
 
 ```json
-"download": {
-  "mode": "manual"
+{
+  "download": {
+    "mode": "manual"
+  }
 }
 ```
 
@@ -225,10 +229,10 @@ Manifest 最大 8 MiB、最多 20,000 个文件；JVM/服务端参数数组各�
 ```text
 global   = clamp(cpu * 4, 8, 64)
 per-host = min(global, clamp(cpu * 2, 4, 32))
-per-file = min(per-host, clamp(cpu, 2, 16))
+per-file = min(global, clamp(cpu * 2, 2, 32))
 ```
 
-大文件在服务器支持可靠 Range 时按文件大小和预算分段；服务器忽略或不满足 Range 契约时会回到完整传输，而不会发布未经验证的部分文件。官方 Loader 安装器内部的库下载仍由上游 Java 安装器负责。
+大文件在服务器支持可靠 Range 时按文件大小和预算分段；服务器忽略或不满足 Range 契约时会回到完整传输，而不会发布未经验证的部分文件。安装器 JAR 中的 `version.json` 与 `install_profile.json` 会先由同一个并发引擎批量预下载到 `libraries/`，Minecraft client/server 文件也会预下载并校验；安装器只负责处理器解包、重映射等生成步骤，未声明或预下载失败的依赖才由上游作为兜底。
 
 ## 发布资产
 

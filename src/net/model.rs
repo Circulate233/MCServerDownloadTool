@@ -147,13 +147,20 @@ impl NetworkLimits {
         }
         let global_requests = logical_cpus.saturating_mul(4).clamp(8, 64);
         let requests_per_host = global_requests.min(logical_cpus.saturating_mul(2).clamp(4, 32));
-        let requests_per_file = requests_per_host.min(logical_cpus.clamp(2, 16));
+        // A loader installer library can be a single large artifact. Give one
+        // artifact enough Range workers to use most of the host budget, just
+        // like the pack downloader does; the shared host/global budgets still
+        // cap total sockets and requests.
+        let requests_per_file = logical_cpus.saturating_mul(2).clamp(2, 32);
         Ok(Self {
             global_requests,
             requests_per_host,
             requests_per_file,
-            segment_threshold: 16 * 1024 * 1024,
-            target_segment_size: 8 * 1024 * 1024,
+            // Small Maven artifacts benefit from concurrent transfer too. The
+            // verifier and strict Range fallback keep this aggressive policy
+            // safe for mirrors that do not correctly support byte ranges.
+            segment_threshold: 2 * 1024 * 1024,
+            target_segment_size: 512 * 1024,
         })
     }
 

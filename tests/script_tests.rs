@@ -317,6 +317,48 @@ fn modified_script_is_preserved_and_complete_replacement_is_published() {
     );
 }
 
+#[test]
+fn legacy_tool_generated_windows_script_is_replaced_with_pausing_script() {
+    let temp = tempfile::tempdir().unwrap();
+    let server_root = temp.path().join("server");
+    fs::create_dir_all(&server_root).unwrap();
+    fs::write(
+        server_root.join("start.bat"),
+        br#"@echo off
+set "MCSDT_HELPER=%~dp0MCServerDownloadTool-windows-x86_64.exe"
+"\?\C:\Java\bin\java.exe" -jar "server.jar"
+:mcsdt_after_launch
+exit /b %ERRORLEVEL%
+"#,
+    )
+    .unwrap();
+
+    let java = java();
+    let launch = VerifiedLaunch::Jar {
+        path: "server.jar".into(),
+    };
+    let outcome = write_start_script(
+        &server_root,
+        &ScriptRequest {
+            platform: ScriptPlatform::Windows,
+            java_executable: Path::new(r"\\?\C:\Java\bin\java.exe"),
+            console_helper_executable: Path::new("C:/MCServerDownloadTool/installer.exe"),
+            java: &java,
+            launch: &launch,
+            windows_failure: WindowsFailureBehavior::PauseOwnedConsole,
+            previous_script_sha256: None,
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(outcome, ScriptOutcome::Published { .. }));
+    let generated = fs::read_to_string(server_root.join("start.bat")).unwrap();
+    assert!(generated.contains("MCSDT-GENERATED-START-SCRIPT v2"));
+    assert!(generated.contains("pause\r\n"));
+    assert!(!generated.contains(r"\\?\"));
+    assert!(!server_root.join("start.bat.new").exists());
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_script_executes_special_paths_and_applies_console_ownership_behavior() {

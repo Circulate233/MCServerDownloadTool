@@ -361,12 +361,12 @@ fn automatic_limit_formula_clamps_each_budget() {
 
     for (cpus, expected) in [
         (1, (8, 4, 2)),
-        (2, (8, 4, 2)),
-        (3, (12, 6, 3)),
-        (8, (32, 16, 8)),
-        (16, (64, 32, 16)),
-        (32, (64, 32, 16)),
-        (usize::MAX, (64, 32, 16)),
+        (2, (8, 4, 4)),
+        (3, (12, 6, 6)),
+        (8, (32, 16, 16)),
+        (16, (64, 32, 32)),
+        (32, (64, 32, 32)),
+        (usize::MAX, (64, 32, 32)),
     ] {
         let limits = NetworkLimits::for_parallelism(cpus).unwrap();
         assert_eq!(
@@ -382,6 +382,14 @@ fn automatic_limit_formula_clamps_each_budget() {
         NetworkLimits::for_parallelism(0),
         Err(NetworkError::InvalidConfiguration { .. })
     ));
+}
+
+#[test]
+fn automatic_limits_match_the_pack_downloader_aggressive_range_policy() {
+    let workstation = NetworkLimits::for_parallelism(16).unwrap();
+    assert_eq!(workstation.segment_threshold, 2 * 1024 * 1024);
+    assert_eq!(workstation.target_segment_size, 512 * 1024);
+    assert_eq!(workstation.range_segment_count(16 * 1024 * 1024), 32);
 }
 
 #[test]

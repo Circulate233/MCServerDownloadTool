@@ -377,6 +377,6 @@ fn main() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.contains("Press Enter to close this window"));
+    assert!(output.contains("Press any key to continue"));
     assert!(output.contains("invalid") || output.contains("unexpected argument"));
 }

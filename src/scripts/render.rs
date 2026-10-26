@@ -24,7 +24,7 @@ pub enum ScriptPlatform {
 pub enum WindowsFailureBehavior {
     /// Return Java's exit status without waiting for input.
     Return,
-    /// Pause after success or failure when the batch file owns the interactive invocation.
+    /// Pause after success or failure so direct and Explorer launches remain readable.
     PauseOwnedConsole,
 }
 
@@ -111,7 +111,8 @@ pub fn write_start_script(
         let tool_owned = existing_hash == generated_hash
             || request
                 .previous_script_sha256
-                .is_some_and(|previous| previous.eq_ignore_ascii_case(&existing_hash));
+                .is_some_and(|previous| previous.eq_ignore_ascii_case(&existing_hash))
+            || looks_like_generated_script(request.platform, &existing);
         if !tool_owned {
             let generated = server_root.join(format!("{name}.new"));
             atomic::write(&generated, &bytes).map_err(|source| ScriptError::Io {
@@ -148,19 +149,13 @@ fn render_windows(request: &ScriptRequest<'_>) -> Result<String, ScriptError> {
     let mut arguments = common_arguments(request);
     append_launch(&mut arguments, request.launch, ScriptPlatform::Windows);
     arguments.extend(request.java.server_args.iter().cloned());
-    let mut command = quote_windows(
-        request
-            .java_executable
-            .as_os_str()
-            .to_string_lossy()
-            .as_ref(),
-    )?;
+    let mut command = quote_windows(&windows_executable_path(request.java_executable))?;
     for argument in arguments {
         command.push(' ');
         command.push_str(&quote_windows(&argument)?);
     }
     let mut script = String::from(
-        "@echo off\r\nsetlocal DisableDelayedExpansion\r\nfor /f \"tokens=2 delims=:\" %%# in ('chcp') do set \"MCSDT_CODEPAGE=%%#\"\r\nchcp 65001 >nul\r\n",
+        "@echo off\r\nrem MCSDT-GENERATED-START-SCRIPT v2\r\nsetlocal DisableDelayedExpansion\r\nfor /f \"tokens=2 delims=:\" %%# in ('chcp') do set \"MCSDT_CODEPAGE=%%#\"\r\nchcp 65001 >nul\r\n",
     );
     if request.windows_failure == WindowsFailureBehavior::PauseOwnedConsole {
         let helper_name = request
@@ -176,7 +171,7 @@ fn render_windows(request: &ScriptRequest<'_>) -> Result<String, ScriptError> {
                     .to_string(),
             });
         }
-        script.push_str("set \"MCSDT_OWNED_CONSOLE=0\"\r\n");
+        script.push_str("set \"MCSDT_OWNED_CONSOLE=1\"\r\n");
         write!(
             script,
             "set \"MCSDT_HELPER=%~dp0{helper_name}\"\r\n\
@@ -205,7 +200,11 @@ popd\r\n"
         // The batch file may have created the console itself. Keep that
         // transient window open for both success and failure so users can read
         // the final server status and any diagnostics.
-        script.push_str("if \"%MCSDT_OWNED_CONSOLE%\"==\"1\" pause\r\n");
+        script.push_str(
+            "echo.\r\n\
+if \"%MCSDT_EXIT%\"==\"0\" (echo Server process exited normally with code 0.) else (echo Server process exited with code %MCSDT_EXIT%.)\r\n\
+pause\r\n",
+        );
     }
     script.push_str("exit /b %MCSDT_EXIT%\r\n");
     Ok(script)
@@ -228,6 +227,7 @@ fn render_unix(request: &ScriptRequest<'_>) -> Result<String, ScriptError> {
     }
     Ok(format!(
         "#!/bin/sh\n\
+# MCSDT-GENERATED-START-SCRIPT v2\n\
 case $0 in\n\
   */*) MCSDT_SCRIPT_DIR=${{0%/*}} ;;\n\
   *) MCSDT_SCRIPT_DIR=. ;;\n\
@@ -265,6 +265,35 @@ fn append_launch(arguments: &mut Vec<String>, launch: &VerifiedLaunch, platform:
 
 fn slash_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+/// `std::fs::canonicalize` on Windows commonly returns an extended-length
+/// (`\\?\\`) path. `cmd.exe` does not reliably launch Java from that spelling,
+/// so generated batch files use the ordinary DOS/UNC form when it is safe to
+/// do so. Filesystem APIs and the persisted install state retain the canonical
+/// path; this conversion is limited to the command line presentation.
+fn windows_executable_path(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    let value = if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        value
+            .strip_prefix(r"\\?\")
+            .unwrap_or(value.as_ref())
+            .to_owned()
+    };
+    value.replace('\\', "/")
+}
+
+fn looks_like_generated_script(platform: ScriptPlatform, bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    match platform {
+        ScriptPlatform::Windows => {
+            text.contains("MCSDT-GENERATED-START-SCRIPT")
+                || (text.contains("MCSDT_HELPER=") && text.contains("mcsdt_after_launch"))
+        }
+        ScriptPlatform::Unix => text.contains("MCSDT-GENERATED-START-SCRIPT"),
+    }
 }
 
 fn quote_windows(value: &str) -> Result<String, ScriptError> {

@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::path::Path;
 
 use clap::ValueEnum;
 use clap::error::{ContextKind, ErrorKind};
@@ -660,8 +661,8 @@ impl Localizer {
         match event {
             InstallEvent::Stage(stage) => self.install_stage(*stage).to_string(),
             InstallEvent::Reused { target } => match self.language {
-                Language::EnUs => format!("reused verified file: {}", target.display()),
-                Language::ZhCn => format!("复用已验证文件：{}", target.display()),
+                Language::EnUs => format!("reused verified file: {}", display_path(target)),
+                Language::ZhCn => format!("复用已验证文件：{}", display_path(target)),
             },
             InstallEvent::Transfer(event) => match self.language {
                 Language::EnUs => format!(
@@ -684,6 +685,22 @@ impl Localizer {
                 Language::EnUs => "verified loader output; installer execution skipped".to_string(),
                 Language::ZhCn => "Loader 输出验证通过，已跳过安装器执行".to_string(),
             },
+            InstallEvent::LoaderLibrariesPrepared { count } => match self.language {
+                Language::EnUs => format!(
+                    "prepared {count} loader library or runtime artifact(s) with the parallel downloader"
+                ),
+                Language::ZhCn => {
+                    format!("已通过并发下载器准备 {count} 个 Loader 库或运行时文件")
+                }
+            },
+            InstallEvent::LoaderLibraryPreseedWarning { detail } => match self.language {
+                Language::EnUs => format!(
+                    "parallel loader-library download was incomplete ({detail}); the installer will fetch any remaining dependencies"
+                ),
+                Language::ZhCn => {
+                    format!("Loader 库并发预下载未全部完成（{detail}）；安装器将继续下载缺失依赖")
+                }
+            },
             InstallEvent::ManualDownloadRequired {
                 name,
                 path,
@@ -691,32 +708,32 @@ impl Localizer {
             } => match self.language {
                 Language::EnUs => format!(
                     "CurseForge file '{name}' cannot be downloaded automatically. Open {project_page} to download it, then save it to '{}'",
-                    path.display(),
+                    display_path(path),
                 ),
                 Language::ZhCn => format!(
                     "CurseForge 文件“{name}”无法自动下载，请打开此链接下载：{project_page}，然后保存到“{}”",
-                    path.display(),
+                    display_path(path),
                 ),
             },
             InstallEvent::ManualFilesPending { count, list_path } => match self.language {
                 Language::EnUs => format!(
                     "{count} manual file(s) are still missing; installation will continue. See '{}' and add them before starting the server",
-                    list_path.display()
+                    display_path(list_path)
                 ),
                 Language::ZhCn => format!(
                     "仍有 {count} 个手动文件缺失，安装将继续；请查看“{}”，补齐后再启动服务端",
-                    list_path.display()
+                    display_path(list_path)
                 ),
             },
             InstallEvent::CleanupWarning { path, reason } => match self.language {
                 Language::EnUs => {
                     format!(
                         "could not remove temporary file '{}': {reason}",
-                        path.display()
+                        display_path(path)
                     )
                 }
                 Language::ZhCn => {
-                    format!("无法删除临时文件“{}”：{reason}", path.display())
+                    format!("无法删除临时文件“{}”：{reason}", display_path(path))
                 }
             },
         }
@@ -750,10 +767,10 @@ impl Localizer {
 
     /// Formats the final successful installation summary.
     #[must_use]
-    pub fn installation_complete(self, root: &std::path::Path) -> String {
+    pub fn installation_complete(self, root: &Path) -> String {
         match self.language {
-            Language::EnUs => format!("server installation completed: {}", root.display()),
-            Language::ZhCn => format!("服务端安装完成：{}", root.display()),
+            Language::EnUs => format!("server installation completed: {}", display_path(root)),
+            Language::ZhCn => format!("服务端安装完成：{}", display_path(root)),
         }
     }
 
@@ -763,6 +780,9 @@ impl Localizer {
             (Language::EnUs, InstallStage::SelectingJava) => "discovering compatible Java runtimes",
             (Language::EnUs, InstallStage::Inspecting) => "validating existing installation state",
             (Language::EnUs, InstallStage::Downloading) => "downloading required artifacts",
+            (Language::EnUs, InstallStage::DownloadingLoaderLibraries) => {
+                "downloading loader libraries in parallel"
+            }
             (Language::EnUs, InstallStage::CheckingManualFiles) => "checking manual files",
             (Language::EnUs, InstallStage::InstallingLoader) => "installing and verifying loader",
             (Language::EnUs, InstallStage::WritingState) => {
@@ -773,12 +793,29 @@ impl Localizer {
             (Language::ZhCn, InstallStage::SelectingJava) => "正在发现兼容的 Java 运行时",
             (Language::ZhCn, InstallStage::Inspecting) => "正在验证已有安装状态",
             (Language::ZhCn, InstallStage::Downloading) => "正在下载所需文件",
+            (Language::ZhCn, InstallStage::DownloadingLoaderLibraries) => "正在并发下载 Loader 库",
             (Language::ZhCn, InstallStage::CheckingManualFiles) => "正在检查手动文件",
             (Language::ZhCn, InstallStage::InstallingLoader) => "正在安装并验证 Loader",
             (Language::ZhCn, InstallStage::WritingState) => "正在写入启动脚本和安装状态",
             (Language::ZhCn, InstallStage::Completed) => "安装已完成",
         }
     }
+}
+
+fn display_path(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{unc}");
+        }
+        value
+            .strip_prefix(r"\\?\")
+            .unwrap_or(value.as_ref())
+            .to_owned()
+    }
+    #[cfg(not(windows))]
+    value.into_owned()
 }
 
 enum JavaProcessIoOperation<'a> {

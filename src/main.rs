@@ -1,7 +1,11 @@
 #![forbid(unsafe_code)]
 
+#[cfg(windows)]
+use std::io::IsTerminal as _;
 use std::io::{self, Write as _};
 use std::process;
+#[cfg(windows)]
+use std::process::Command;
 use std::sync::Arc;
 
 use mc_server_download_tool::application::run;
@@ -18,7 +22,7 @@ fn main() {
     }
     install_panic_pause_hook();
     let exit_code = run_installer();
-    pause_if_explorer_console();
+    pause_if_interactive_console();
     process::exit(exit_code);
 }
 
@@ -83,21 +87,19 @@ fn console_owner_exit_code() -> i32 {
 }
 
 #[cfg(windows)]
-fn pause_if_explorer_console() {
-    // A console executable started from Explorer owns the transient console
-    // window. Keep it open for every terminal outcome so users can read a
-    // successful completion, a recoverable error, or a panic report.
-    // `read_line` returns immediately when Explorer supplied an EOF/redirected
-    // standard input, so this does not turn non-interactive invocations into a
-    // deadlock.
-    if !launched_from_explorer() {
+fn pause_if_interactive_console() {
+    // Keep interactive terminal runs visible on success, error, and panic. This
+    // also covers PowerShell launches, where Explorer is not a process parent.
+    // Piped and redirected invocations remain non-interactive and never block.
+    if !(io::stdin().is_terminal() || launched_from_explorer()) {
         return;
     }
     PAUSE_AFTER_RUN.call_once(|| {
-        print!("按 Enter 键关闭此窗口 / Press Enter to close this window...");
+        print!("按任意键继续 / Press any key to continue...");
         let _ = io::stdout().flush();
-        let mut line = String::new();
-        let _ = io::stdin().read_line(&mut line);
+        let _ = Command::new("cmd.exe")
+            .args(["/d", "/c", "pause >nul"])
+            .status();
     });
 }
 
@@ -106,7 +108,7 @@ fn install_panic_pause_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
         default_hook(panic);
-        pause_if_explorer_console();
+        pause_if_interactive_console();
     }));
 }
 
@@ -138,7 +140,7 @@ const fn console_owner_exit_code() -> i32 {
 }
 
 #[cfg(not(windows))]
-const fn pause_if_explorer_console() {}
+const fn pause_if_interactive_console() {}
 
 #[cfg(not(windows))]
 const fn install_panic_pause_hook() {}

@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -6,6 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use reqwest::header::{HeaderName, HeaderValue};
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 
@@ -30,6 +33,13 @@ use super::{DownloadTarget, InstallRoot, InstallSession};
 const MISSING_FILES: &str = "missing-files.txt";
 const MAX_SHA1_SIDECAR_RESPONSE: usize = 1024;
 const MAX_LOADER_INSTALLER_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_INSTALLER_VERSION_JSON_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_INSTALLER_LIBRARY_COUNT: usize = 4096;
+const MAX_INSTALLER_LIBRARY_BYTES: u64 = 512 * 1024 * 1024;
+// Keep the batch at the transfer worker ceiling so a loader with hundreds of
+// small Maven artifacts can fill the shared request budget. The network engine
+// still applies its global, per-host, and per-file limits.
+const INSTALLER_LIBRARY_BATCH_SIZE: usize = 32;
 static DOWNLOAD_TARGET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Installation state-machine boundary used by the CLI integration layer.
@@ -149,6 +159,10 @@ where
             &observer,
             plan.language,
         )?;
+
+        if !reusable_loader {
+            predownload_installer_libraries(&self.engine, &paths, plan, &observer)?;
+        }
 
         emit(
             &observer,
@@ -327,6 +341,645 @@ fn transfer_and_publish<E: ArtifactTransfer>(
         return Err(InstallError::Transfer { failures });
     }
     Ok(unavailable_files)
+}
+
+/// Downloads dependencies declared by the loader's embedded `version.json` before
+/// starting its Java installer. Most Forge-family installers then find these
+/// verified files in `libraries/` and skip their own one-at-a-time downloads.
+/// Unsupported installer formats and individual transfer failures are warnings:
+/// the official installer remains the fallback for anything not prepared here.
+fn predownload_installer_libraries<E: ArtifactTransfer>(
+    engine: &E,
+    paths: &InstallPaths,
+    plan: &InstallPlan,
+    observer: &Arc<dyn InstallObserver>,
+) -> Result<(), InstallError> {
+    paths.security.verify_existing_file(&paths.installer)?;
+    let preseed =
+        match read_installer_preseed_items(&paths.installer, &plan.loader.minecraft_version) {
+            Ok(preseed) => preseed,
+            Err(reason) => {
+                emit(
+                    observer,
+                    InstallEvent::LoaderLibraryPreseedWarning { detail: reason },
+                )?;
+                return Ok(());
+            }
+        };
+    if preseed.items.is_empty() {
+        emit(
+            observer,
+            InstallEvent::LoaderLibraryPreseedWarning {
+                detail: "the installer has no supported downloadable dependencies in version.json"
+                    .to_string(),
+            },
+        )?;
+        return Ok(());
+    }
+
+    let profile_skipped = preseed.skipped;
+    let preparation = prepare_installer_libraries(paths, plan, preseed, observer)?;
+    if !preparation.pending.is_empty() {
+        emit(
+            observer,
+            InstallEvent::Stage(InstallStage::DownloadingLoaderLibraries),
+        )?;
+    }
+    let download =
+        transfer_installer_libraries(engine, observer, &preparation.pending, preparation.prepared)?;
+
+    if download.failures > 0 || profile_skipped > 0 || preparation.skipped_conflicts > 0 {
+        let remaining = preparation.total.saturating_sub(download.prepared);
+        let mut detail = format!(
+            "prepared {} of {} declared dependency artifact(s); {remaining} remain",
+            download.prepared, preparation.total
+        );
+        if profile_skipped > 0 || preparation.skipped_conflicts > 0 {
+            let _ = write!(
+                detail,
+                "; {} unsupported or conflicting entry/entries were left to the installer",
+                profile_skipped + preparation.skipped_conflicts
+            );
+        }
+        if let Some(reason) = download.first_failure {
+            let _ = write!(detail, "; first transfer failure: {reason}");
+        }
+        emit(
+            observer,
+            InstallEvent::LoaderLibraryPreseedWarning { detail },
+        )?;
+    } else {
+        emit(
+            observer,
+            InstallEvent::LoaderLibrariesPrepared {
+                count: download.prepared,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+struct InstallerLibraryPreparation {
+    total: usize,
+    prepared: usize,
+    skipped_conflicts: usize,
+    pending: Vec<PendingArtifact>,
+}
+
+fn prepare_installer_libraries(
+    paths: &InstallPaths,
+    plan: &InstallPlan,
+    preseed: InstallerPreseedItems,
+    observer: &Arc<dyn InstallObserver>,
+) -> Result<InstallerLibraryPreparation, InstallError> {
+    let total = preseed.items.len();
+    let mut prepared = 0_usize;
+    let mut skipped_conflicts = 0_usize;
+    let mut pending = Vec::new();
+    for item in preseed.items {
+        let relative = Path::new(&item.path);
+        if conflicts_with_manifest_or_output(plan, relative) {
+            skipped_conflicts += 1;
+            continue;
+        }
+        let target = paths.security.resolve(relative)?;
+        create_target_parent(&paths.security, &target)?;
+        match fs::symlink_metadata(&target) {
+            Ok(_) => {
+                paths.security.verify_existing_file(&target)?;
+                if verify_sha1_size(&target, &item.sha1, item.size).is_ok() {
+                    prepared += 1;
+                    emit(
+                        observer,
+                        InstallEvent::Reused {
+                            target: target.clone(),
+                        },
+                    )?;
+                    continue;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(InstallError::io("inspect loader library", &target, source));
+            }
+        }
+        let download_target = paths.security.download_target(
+            &target,
+            DOWNLOAD_TARGET_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        )?;
+        pending.push(PendingArtifact::loader_library(download_target, &item)?);
+    }
+    Ok(InstallerLibraryPreparation {
+        total,
+        prepared,
+        skipped_conflicts,
+        pending,
+    })
+}
+
+struct InstallerLibraryDownload {
+    prepared: usize,
+    failures: usize,
+    first_failure: Option<String>,
+}
+
+fn transfer_installer_libraries<E: ArtifactTransfer>(
+    engine: &E,
+    observer: &Arc<dyn InstallObserver>,
+    pending: &[PendingArtifact],
+    mut prepared: usize,
+) -> Result<InstallerLibraryDownload, InstallError> {
+    let transfer_observer: Arc<dyn TransferObserver> = Arc::new(TransferBridge {
+        observer: Arc::clone(observer),
+    });
+    let mut failures = 0_usize;
+    let mut first_failure = None;
+    for chunk in pending.chunks(INSTALLER_LIBRARY_BATCH_SIZE) {
+        let mut round = chunk.to_vec();
+        while !round.is_empty() {
+            let round_size = round.len();
+            let requests = round
+                .iter()
+                .map(|artifact| artifact.request.clone())
+                .collect();
+            let results = engine.transfer_many(requests, Arc::clone(&transfer_observer));
+            observer.check()?;
+            if results.len() != round_size {
+                return Err(InstallError::Transfer {
+                    failures: vec![format!(
+                        "loader-library downloader returned {} result(s) for {round_size} request(s)",
+                        results.len()
+                    )],
+                });
+            }
+            let mut retry = Vec::new();
+            for (artifact, result) in round.into_iter().zip(results) {
+                match result {
+                    Ok(_) => {
+                        observer.check()?;
+                        match artifact.verify_staging() {
+                            Ok(()) => {
+                                artifact.publish()?;
+                                prepared += 1;
+                            }
+                            Err(InstallError::Verification { reason, .. }) => {
+                                failures += 1;
+                                first_failure.get_or_insert(reason);
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(TransferError::Cancelled { .. }) => retry.push(artifact),
+                    Err(error) => {
+                        failures += 1;
+                        first_failure.get_or_insert_with(|| error.to_string());
+                    }
+                }
+            }
+            if !retry.is_empty() && retry.len() == round_size {
+                failures += retry.len();
+                first_failure.get_or_insert_with(|| {
+                    "all loader-library requests were cancelled without a reported cause"
+                        .to_string()
+                });
+                break;
+            }
+            round = retry;
+        }
+    }
+    Ok(InstallerLibraryDownload {
+        prepared,
+        failures,
+        first_failure,
+    })
+}
+
+fn conflicts_with_manifest_or_output(plan: &InstallPlan, target: &Path) -> bool {
+    let normalized = target
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    plan.files
+        .iter()
+        .any(|file| file.path.replace('\\', "/").to_ascii_lowercase() == normalized)
+        || match &plan.loader.output {
+            crate::loader::LoaderOutputExpectation::ModernArgs { windows, unix } => {
+                windows == target || unix == target
+            }
+            crate::loader::LoaderOutputExpectation::ExactJar { path, .. } => path == target,
+        }
+}
+
+#[derive(Debug)]
+struct InstallerPreseedItems {
+    items: Vec<InstallerLibrary>,
+    skipped: usize,
+}
+
+#[derive(Debug, Clone)]
+struct InstallerLibrary {
+    task_id: String,
+    path: String,
+    url: String,
+    sha1: String,
+    size: Option<u64>,
+}
+
+/// Reads verified-download metadata from the same profile used by loader installers.
+/// Paths and URLs are treated as untrusted even though the installer itself has
+/// already passed its manifest checksum.
+fn read_installer_preseed_items(
+    installer: &Path,
+    minecraft_version: &str,
+) -> Result<InstallerPreseedItems, String> {
+    let file = File::open(installer)
+        .map_err(|error| format!("could not open installer archive: {error}"))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|error| format!("installer is not a readable ZIP archive: {error}"))?;
+    let mut items = Vec::new();
+    let mut skipped = 0_usize;
+    let mut declared = 0_usize;
+    let mut paths = BTreeMap::<String, String>::new();
+
+    let version: InstallerVersionJson =
+        read_installer_json(&mut archive, "version.json", true, "version.json")?
+            .expect("required installer version.json must be present");
+    append_installer_profile_libraries(
+        version.libraries,
+        &mut items,
+        &mut skipped,
+        &mut declared,
+        &mut paths,
+    )?;
+
+    append_minecraft_download(
+        version.downloads.client,
+        format!("versions/{minecraft_version}/{minecraft_version}.jar"),
+        "minecraft-client-jar",
+        &mut items,
+        &mut skipped,
+        &mut declared,
+        &mut paths,
+    )?;
+    append_minecraft_download(
+        version.downloads.server,
+        "server.jar".to_string(),
+        "minecraft-server-jar",
+        &mut items,
+        &mut skipped,
+        &mut declared,
+        &mut paths,
+    )?;
+
+    // Forge-family installers keep processor-only dependencies (for example
+    // Cleanroom's mcp_config ZIP) in install_profile.json rather than the
+    // Minecraft version profile. Treat this file as optional so Fabric and
+    // other installers that only ship version.json continue to work.
+    if let Some(install_profile) = read_installer_json::<InstallerInstallProfile>(
+        &mut archive,
+        "install_profile.json",
+        false,
+        "install_profile.json",
+    )? {
+        append_installer_profile_libraries(
+            install_profile.libraries,
+            &mut items,
+            &mut skipped,
+            &mut declared,
+            &mut paths,
+        )?;
+    }
+    Ok(InstallerPreseedItems { items, skipped })
+}
+
+fn read_installer_json<T: DeserializeOwned>(
+    archive: &mut zip::ZipArchive<File>,
+    name: &str,
+    required: bool,
+    description: &str,
+) -> Result<Option<T>, String> {
+    let entry = match archive.by_name(name) {
+        Ok(entry) => entry,
+        Err(zip::result::ZipError::FileNotFound) if !required => return Ok(None),
+        Err(error) => {
+            return Err(if required {
+                format!("installer does not contain a readable {description}: {error}")
+            } else {
+                format!("could not open optional {description}: {error}")
+            });
+        }
+    };
+    if entry.size() > MAX_INSTALLER_VERSION_JSON_BYTES {
+        return Err(format!(
+            "embedded {description} exceeds the {MAX_INSTALLER_VERSION_JSON_BYTES}-byte limit"
+        ));
+    }
+    let mut bytes = Vec::new();
+    entry
+        .take(MAX_INSTALLER_VERSION_JSON_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read embedded {description}: {error}"))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_INSTALLER_VERSION_JSON_BYTES {
+        return Err(format!(
+            "embedded {description} exceeds the {MAX_INSTALLER_VERSION_JSON_BYTES}-byte limit"
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("embedded {description} is invalid: {error}"))
+}
+
+fn append_installer_profile_libraries(
+    libraries: Vec<InstallerVersionLibrary>,
+    items: &mut Vec<InstallerLibrary>,
+    skipped: &mut usize,
+    declared: &mut usize,
+    paths: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    for library in libraries {
+        append_installer_library_artifact(
+            &library.name,
+            library.downloads.artifact,
+            None,
+            items,
+            skipped,
+            declared,
+            paths,
+        )?;
+        for (classifier, artifact) in library.downloads.classifiers {
+            append_installer_library_artifact(
+                &library.name,
+                Some(artifact),
+                Some(&classifier),
+                items,
+                skipped,
+                declared,
+                paths,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn append_installer_library_artifact(
+    coordinate: &str,
+    artifact: Option<InstallerArtifactEntry>,
+    classifier: Option<&str>,
+    items: &mut Vec<InstallerLibrary>,
+    skipped: &mut usize,
+    declared: &mut usize,
+    paths: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    *declared = (*declared).saturating_add(1);
+    if *declared > MAX_INSTALLER_LIBRARY_COUNT {
+        return Err(format!(
+            "installer profile declares more than {MAX_INSTALLER_LIBRARY_COUNT} library entries"
+        ));
+    }
+    let Some(artifact) = artifact else {
+        *skipped = skipped.saturating_add(1);
+        return Ok(());
+    };
+    let coordinate = classifier.map_or_else(
+        || coordinate.to_string(),
+        |classifier| maven_coordinate_with_classifier(coordinate, classifier),
+    );
+    let Some(item) = installer_library_from_artifact(
+        &coordinate,
+        artifact,
+        format!("loader-library-{}", items.len()),
+        "libraries",
+    ) else {
+        *skipped = skipped.saturating_add(1);
+        return Ok(());
+    };
+    if register_installer_library(paths, &item)? {
+        items.push(item);
+    }
+    Ok(())
+}
+
+fn append_minecraft_download(
+    artifact: Option<InstallerArtifactEntry>,
+    path: String,
+    task_id: &str,
+    items: &mut Vec<InstallerLibrary>,
+    skipped: &mut usize,
+    declared: &mut usize,
+    paths: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    let Some(mut artifact) = artifact else {
+        return Ok(());
+    };
+    *declared = (*declared).saturating_add(1);
+    if *declared > MAX_INSTALLER_LIBRARY_COUNT {
+        return Err(format!(
+            "installer profile declares more than {MAX_INSTALLER_LIBRARY_COUNT} library entries"
+        ));
+    }
+    artifact.path = Some(path);
+    let Some(item) =
+        installer_library_from_artifact("minecraft-artifact", artifact, task_id.to_string(), "")
+    else {
+        *skipped = skipped.saturating_add(1);
+        return Ok(());
+    };
+    if register_installer_library(paths, &item)? {
+        items.push(item);
+    }
+    Ok(())
+}
+
+fn register_installer_library(
+    paths: &mut BTreeMap<String, String>,
+    item: &InstallerLibrary,
+) -> Result<bool, String> {
+    let identity = item.path.to_ascii_lowercase();
+    if let Some(previous_sha1) = paths.get(&identity) {
+        if previous_sha1 == &item.sha1 {
+            return Ok(false);
+        }
+        return Err(format!(
+            "embedded profile assigns conflicting checksums to '{}'",
+            item.path
+        ));
+    }
+    paths.insert(identity, item.sha1.clone());
+    Ok(true)
+}
+
+fn installer_library_from_artifact(
+    coordinate: &str,
+    artifact: InstallerArtifactEntry,
+    task_id: String,
+    target_prefix: &str,
+) -> Option<InstallerLibrary> {
+    let path = artifact
+        .path
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| maven_path_from_coordinate(coordinate))?;
+    let path = normalize_installer_library_path(&path)?;
+    let url = artifact.url.filter(|value| !value.trim().is_empty())?;
+    if url.len() > 8192 {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(&url).ok()?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    let sha1 = artifact
+        .sha1
+        .filter(|value| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))?;
+    let size = artifact.size;
+    if size.is_some_and(|size| size == 0 || size > MAX_INSTALLER_LIBRARY_BYTES) {
+        return None;
+    }
+    let target_path = if target_prefix.is_empty() {
+        path
+    } else {
+        format!("{target_prefix}/{path}")
+    };
+    Some(InstallerLibrary {
+        task_id,
+        path: target_path,
+        url,
+        sha1: sha1.to_ascii_lowercase(),
+        size,
+    })
+}
+
+fn maven_path_from_coordinate(coordinate: &str) -> Option<String> {
+    let (coordinate, extension) = coordinate
+        .rsplit_once('@')
+        .map_or((coordinate, "jar"), |(left, right)| (left, right));
+    let parts = coordinate.split(':').collect::<Vec<_>>();
+    if !(3..=4).contains(&parts.len())
+        || parts.iter().any(|part| !valid_maven_segment(part))
+        || !valid_maven_segment(extension)
+        || parts[0].split('.').any(str::is_empty)
+    {
+        return None;
+    }
+    let classifier = parts
+        .get(3)
+        .map_or_else(String::new, |value| format!("-{value}"));
+    Some(format!(
+        "{}/{}/{}/{}-{}{}.{}",
+        parts[0].replace('.', "/"),
+        parts[1],
+        parts[2],
+        parts[1],
+        parts[2],
+        classifier,
+        extension
+    ))
+}
+
+fn maven_coordinate_with_classifier(coordinate: &str, classifier: &str) -> String {
+    coordinate.rsplit_once('@').map_or_else(
+        || format!("{coordinate}:{classifier}"),
+        |(base, extension)| format!("{base}:{classifier}@{extension}"),
+    )
+}
+
+fn valid_maven_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.contains("..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+'))
+}
+
+fn normalize_installer_library_path(path: &str) -> Option<String> {
+    if path.len() > 4096 || path.contains('\0') {
+        return None;
+    }
+    let normalized = path.replace('\\', "/");
+    let relative = normalized.strip_prefix("libraries/").unwrap_or(&normalized);
+    if relative.is_empty()
+        || relative.starts_with('/')
+        || relative.contains(':')
+        || relative
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return None;
+    }
+    Some(relative.to_string())
+}
+
+fn installer_library_mirror(url: &str) -> Option<String> {
+    const REPOSITORY_MIRRORS: &[(&str, &str)] = &[
+        (
+            "https://repo.maven.apache.org/maven2",
+            "https://maven.aliyun.com/repository/public",
+        ),
+        (
+            "https://repo.cleanroommc.com/releases",
+            "https://nexus.jsdu.cn/repository",
+        ),
+        (
+            "https://maven.arcseekers.com/releases",
+            "https://nexus.jsdu.cn/repository",
+        ),
+    ];
+    REPOSITORY_MIRRORS
+        .iter()
+        .find_map(|(from, to)| url.strip_prefix(from).map(|suffix| format!("{to}{suffix}")))
+}
+
+#[derive(Debug, Deserialize)]
+struct InstallerVersionJson {
+    #[serde(default)]
+    libraries: Vec<InstallerVersionLibrary>,
+    #[serde(default)]
+    downloads: InstallerVersionDownloads,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct InstallerVersionDownloads {
+    client: Option<InstallerArtifactEntry>,
+    server: Option<InstallerArtifactEntry>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct InstallerInstallProfile {
+    #[serde(default)]
+    libraries: Vec<InstallerVersionLibrary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstallerVersionLibrary {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    downloads: InstallerLibraryDownloads,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct InstallerLibraryDownloads {
+    artifact: Option<InstallerArtifactEntry>,
+    #[serde(default)]
+    classifiers: BTreeMap<String, InstallerArtifactEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstallerArtifactEntry {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    sha1: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 fn create_target_parent(root: &InstallRoot, target: &Path) -> Result<(), InstallError> {
@@ -742,6 +1395,29 @@ impl PendingArtifact {
         })
     }
 
+    fn loader_library(
+        target: DownloadTarget,
+        library: &InstallerLibrary,
+    ) -> Result<Self, InstallError> {
+        let mut builder =
+            ArtifactRequest::builder(&library.task_id, target.staging_path(), &library.url)
+                .expected_sha1(&library.sha1)
+                .maximum_size(MAX_INSTALLER_LIBRARY_BYTES);
+        if let Some(size) = library.size {
+            builder = builder.expected_size(size);
+        }
+        if let Some(mirror) = installer_library_mirror(&library.url) {
+            builder = builder.candidate_url(mirror);
+        }
+        Ok(Self {
+            request: builder.build()?,
+            target,
+            expected_size: library.size,
+            hash: ExpectedHash::Sha1(library.sha1.clone()),
+            manual_file_index: None,
+        })
+    }
+
     fn verify_staging(&self) -> Result<(), InstallError> {
         verify_reader(
             self.target.open_staging().map_err(|source| {
@@ -949,6 +1625,8 @@ impl ProcessObserver for ProcessBridge {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use super::*;
     use crate::manifest::{FileKind, SecretString};
 
@@ -993,6 +1671,87 @@ mod tests {
             forgecdn_mirror_url("https://example.com/files/1234/56/mod.jar"),
             None
         );
+    }
+
+    #[test]
+    fn installer_preseed_reads_version_and_install_profile_dependencies() {
+        let temp = tempfile::tempdir().unwrap();
+        let installer = temp.path().join("installer.jar");
+        let mut archive = zip::ZipWriter::new(File::create(&installer).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        let version = serde_json::json!({
+            "libraries": [{
+                "name": "com.example:library:1.0",
+                "downloads": {"artifact": {
+                    "url": "https://repo.example/library.jar",
+                    "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "size": 10
+                }, "classifiers": {
+                    "natives-windows": {
+                        "url": "https://repo.example/library-natives-windows.jar",
+                        "sha1": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                        "size": 11
+                    }
+                }}
+            }],
+            "downloads": {
+                "client": {
+                    "url": "https://repo.example/client.jar",
+                    "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "size": 20
+                },
+                "server": {
+                    "url": "https://repo.example/server.jar",
+                    "sha1": "cccccccccccccccccccccccccccccccccccccccc",
+                    "size": 30
+                }
+            }
+        });
+        let install_profile = serde_json::json!({
+            "libraries": [{
+                "name": "de.oceanlabs.mcp:mcp_config:1.0@zip",
+                "downloads": {"artifact": {
+                    "path": "de/oceanlabs/mcp/mcp_config/1.0/mcp_config-1.0.zip",
+                    "url": "https://repo.example/mcp.zip",
+                    "sha1": "dddddddddddddddddddddddddddddddddddddddd",
+                    "size": 40
+                }}
+            }]
+        });
+        for (name, value) in [
+            ("version.json", version),
+            ("install_profile.json", install_profile),
+        ] {
+            archive.start_file(name, options).unwrap();
+            archive
+                .write_all(serde_json::to_string(&value).unwrap().as_bytes())
+                .unwrap();
+        }
+        archive.finish().unwrap();
+
+        let preseed = read_installer_preseed_items(&installer, "1.20.1").unwrap();
+        assert_eq!(preseed.skipped, 0);
+        assert_eq!(preseed.items.len(), 5);
+        assert!(
+            preseed
+                .items
+                .iter()
+                .any(|item| item.path == "libraries/com/example/library/1.0/library-1.0.jar")
+        );
+        assert!(
+            preseed.items.iter().any(|item| item.path
+                == "libraries/com/example/library/1.0/library-1.0-natives-windows.jar")
+        );
+        assert!(
+            preseed
+                .items
+                .iter()
+                .any(|item| item.path == "versions/1.20.1/1.20.1.jar")
+        );
+        assert!(preseed.items.iter().any(|item| item.path == "server.jar"));
+        assert!(preseed.items.iter().any(
+            |item| item.path == "libraries/de/oceanlabs/mcp/mcp_config/1.0/mcp_config-1.0.zip"
+        ));
     }
 
     #[test]
