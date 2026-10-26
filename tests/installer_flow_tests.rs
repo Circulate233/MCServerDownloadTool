@@ -238,7 +238,7 @@ fn plan(files: Vec<ManifestFile>, runs: Arc<AtomicUsize>) -> (InstallPlan, FakeL
             )
             .unwrap(),
             output: LoaderOutputExpectation::ExactJar {
-                path: "cleanroom-1.12.2.jar".into(),
+                path: "cleanroom-0.3.0.jar".into(),
                 main_class: None,
             },
         },
@@ -359,7 +359,7 @@ fn automatic_file_and_loader_are_downloaded_once_and_valid_state_skips_reinstall
     let second = installer
         .install(&manifest_path, &plan, Arc::new(|_| {}))
         .unwrap();
-    fs::write(temp.path().join("cleanroom-1.12.2.jar"), b"corrupted").unwrap();
+    fs::write(temp.path().join("cleanroom-0.3.0.jar"), b"corrupted").unwrap();
     let third = installer
         .install(&manifest_path, &plan, Arc::new(|_| {}))
         .unwrap();

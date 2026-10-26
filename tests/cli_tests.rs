@@ -298,3 +298,85 @@ fn manifest_api_key_is_never_echoed_by_process_errors() {
     assert!(stderr.contains("curseforge_api_key"));
     assert!(!stderr.contains("manifest-api-secret"));
 }
+
+#[cfg(windows)]
+#[test]
+fn explorer_started_installer_keeps_console_open_until_enter() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("explorer_parent.rs");
+    let parent = temp.path().join("explorer.exe");
+    fs::write(
+        &source,
+        r#"
+use std::{env, process::{self, Command, Stdio}};
+
+fn main() {
+    let installer = env::args_os().nth(1).expect("installer path");
+    let status = Command::new(installer)
+        .args(["--lang", "en-US", "--mcsdt-explorer-pause-probe-invalid"])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect("start installer");
+    process::exit(status.code().unwrap_or(1));
+}
+"#,
+    )
+    .unwrap();
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let compile = Command::new(rustc)
+        .args(["--edition=2024", "--crate-name", "mcsdt_explorer_parent"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&parent)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "failed to compile Explorer parent helper: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let mut child = Command::new(parent)
+        .arg(env!("CARGO_BIN_EXE_mc-server-download-tool"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "an Explorer-started installer must wait for Enter after reporting an error"
+    );
+    child.stdin.as_mut().unwrap().write_all(b"\r\n").unwrap();
+    child.stdin.take();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("Explorer-started installer did not exit after Enter");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.contains("Press Enter to close this window"));
+    assert!(output.contains("invalid") || output.contains("unexpected argument"));
+}

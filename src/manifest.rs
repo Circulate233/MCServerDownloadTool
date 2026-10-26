@@ -850,7 +850,10 @@ fn validate_loader_contract(
             }
         }
         LoaderKind::Cleanroom => LoaderOutputExpectation::ExactJar {
-            path: format!("cleanroom-{minecraft_version}.jar").into(),
+            // Cleanroom's installer emits the runnable jar using the loader
+            // version (for example cleanroom-0.6.13-alpha.jar), not the
+            // Minecraft version.
+            path: format!("cleanroom-{}.jar", loader.version).into(),
             main_class: None,
         },
         LoaderKind::Forge if is_modern_minecraft(minecraft_version)? => {

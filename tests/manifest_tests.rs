@@ -151,7 +151,7 @@ fn cleanroom_is_reachable_with_an_exact_output() {
     value["loader"]["installer"]["url"] = json!(
         "https://github.com/CleanroomMC/Cleanroom/releases/download/0.3.0/cleanroom-0.3.0-installer.jar"
     );
-    value["loader"]["output"]["path"] = json!("cleanroom-1.12.2.jar");
+    value["loader"]["output"]["path"] = json!("cleanroom-0.3.0.jar");
     value["loader"]["output"]["main_class"] = Value::Null;
 
     assert_eq!(parse(&value).unwrap().loader().kind, LoaderKind::Cleanroom);

@@ -24,7 +24,7 @@
     },
     "output": {
       "type": "exact_jar",
-      "path": "cleanroom-1.12.2.jar",
+      "path": "cleanroom-0.6.7-alpha.jar",
       "main_class": null
     }
   },

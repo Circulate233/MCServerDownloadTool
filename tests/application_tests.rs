@@ -49,7 +49,7 @@ fn manifest_json() -> serde_json::Value {
             },
             "output": {
                 "type": "exact_jar",
-                "path": "cleanroom-1.12.2.jar",
+                "path": "cleanroom-0.6.7-alpha.jar",
                 "main_class": null
             }
         },
@@ -172,7 +172,7 @@ impl InstallExecution for FakeInstall {
         Ok(InstallResult {
             server_root: manifest_path.parent().unwrap().to_path_buf(),
             launch: VerifiedLaunch::Jar {
-                path: "cleanroom-1.12.2.jar".into(),
+                path: "cleanroom-0.6.7-alpha.jar".into(),
             },
             loader_reused: false,
         })
@@ -263,7 +263,7 @@ fn application_passes_saved_java_to_provisioner_before_installation() {
             "manifest_sha256": "00",
             "java_executable": saved,
             "loader_plan_sha256": "00",
-            "loader_output": {"type": "jar", "path": "cleanroom-1.12.2.jar"},
+            "loader_output": {"type": "jar", "path": "cleanroom-0.6.7-alpha.jar"},
             "loader_artifacts": [],
             "script_sha256": "00"
         }))
