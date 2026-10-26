@@ -197,14 +197,13 @@ popd\r\n"
         ":mcsdt_after_launch\r\nif defined MCSDT_CODEPAGE chcp %MCSDT_CODEPAGE% >nul\r\n",
     );
     if request.windows_failure == WindowsFailureBehavior::PauseOwnedConsole {
-        // The batch file may have created the console itself. Keep that
-        // transient window open for both success and failure so users can read
-        // the final server status and any diagnostics.
-        script.push_str(
-            "echo.\r\n\
-if \"%MCSDT_EXIT%\"==\"0\" (echo Server process exited normally with code 0.) else (echo Server process exited with code %MCSDT_EXIT%.)\r\n\
-pause\r\n",
-        );
+        // Keep the transient window open for both success and failure, but do
+        // not print a synthetic status line here. Minecraft may finish its
+        // final stdout/stderr writes at the same time as cmd.exe is tearing
+        // down the batch file; another echo at this point can interleave with
+        // or obscure the actual final diagnostic (including an EULA error).
+        // The Java process exit code is still returned by the batch file.
+        script.push_str("echo.\r\npause\r\n");
     }
     script.push_str("exit /b %MCSDT_EXIT%\r\n");
     Ok(script)

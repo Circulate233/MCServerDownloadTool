@@ -355,6 +355,10 @@ exit /b %ERRORLEVEL%
     let generated = fs::read_to_string(server_root.join("start.bat")).unwrap();
     assert!(generated.contains("MCSDT-GENERATED-START-SCRIPT v2"));
     assert!(generated.contains("pause\r\n"));
+    assert!(
+        !generated.contains("Server process exited"),
+        "the wrapper must not append a synthetic status line after Minecraft output"
+    );
     assert!(!generated.contains(r"\\?\"));
     assert!(!server_root.join("start.bat.new").exists());
 }
