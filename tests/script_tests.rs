@@ -354,7 +354,14 @@ exit /b %ERRORLEVEL%
     assert!(matches!(outcome, ScriptOutcome::Published { .. }));
     let generated = fs::read_to_string(server_root.join("start.bat")).unwrap();
     assert!(generated.contains("MCSDT-GENERATED-START-SCRIPT v2"));
-    assert!(generated.contains("pause\r\n"));
+    let pause_position = generated.find("pause\r\n").unwrap();
+    let codepage_restore_position = generated
+        .find("if defined MCSDT_CODEPAGE chcp %MCSDT_CODEPAGE% >nul\r\n")
+        .unwrap();
+    assert!(
+        codepage_restore_position > pause_position,
+        "restore the original console code page after pausing so it cannot redraw over the final server output"
+    );
     assert!(
         !generated.contains("Server process exited"),
         "the wrapper must not append a synthetic status line after Minecraft output"

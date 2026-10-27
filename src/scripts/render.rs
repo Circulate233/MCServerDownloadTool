@@ -193,18 +193,15 @@ set \"MCSDT_EXIT=%ERRORLEVEL%\"\r\n\
 popd\r\n"
     );
     script.push_str(&execution);
-    script.push_str(
-        ":mcsdt_after_launch\r\nif defined MCSDT_CODEPAGE chcp %MCSDT_CODEPAGE% >nul\r\n",
-    );
+    script.push_str(":mcsdt_after_launch\r\n");
     if request.windows_failure == WindowsFailureBehavior::PauseOwnedConsole {
-        // Keep the transient window open for both success and failure, but do
-        // not print a synthetic status line here. Minecraft may finish its
-        // final stdout/stderr writes at the same time as cmd.exe is tearing
-        // down the batch file; another echo at this point can interleave with
-        // or obscure the actual final diagnostic (including an EULA error).
-        // The Java process exit code is still returned by the batch file.
+        // Keep the transient window open in UTF-8 mode so restoring the prior
+        // console code page cannot redraw the screen before the user has read
+        // Minecraft's final output. Restore the caller's code page only after
+        // the pause has been dismissed.
         script.push_str("echo.\r\npause\r\n");
     }
+    script.push_str("if defined MCSDT_CODEPAGE chcp %MCSDT_CODEPAGE% >nul\r\n");
     script.push_str("exit /b %MCSDT_EXIT%\r\n");
     Ok(script)
 }
